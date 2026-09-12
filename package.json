@@ -1,0 +1,12 @@
+{
+  "name": "gmail-agent",
+  "private": true,
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "dev:web": "npm --workspace web run dev",
+    "build:web": "npm --workspace web run build",
+    "lint:web": "npm --workspace web run lint",
+    "dev:api": "apps/api/.venv/bin/uvicorn app.main:app --app-dir apps/api --reload --port 8000"
+  },
+  "engines": { "node": ">=22.0.0" }
+}
