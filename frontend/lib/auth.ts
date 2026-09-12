@@ -6,6 +6,11 @@ import { postgresAdapter } from "@/lib/auth/postgres-adapter";
 const googleClientId = process.env.AUTH_GOOGLE_ID ?? process.env.GOOGLE_CLIENT_ID ?? process.env.Google_Client_Id;
 const googleClientSecret = process.env.AUTH_GOOGLE_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? process.env.Google_Client_Secret;
 
+export const googleOAuthCredentials = {
+  clientId: googleClientId ?? "",
+  clientSecret: googleClientSecret ?? "",
+};
+
 if (!googleClientId || !googleClientSecret) {
   throw new Error("Google OAuth is not configured. Set AUTH_GOOGLE_ID and AUTH_GOOGLE_SECRET in frontend/.env.local.");
 }
@@ -15,8 +20,9 @@ export const authOptions = {
   adapter: postgresAdapter,
   providers: [
     GoogleProvider({
-      clientId: googleClientId,
-      clientSecret: googleClientSecret,
+      clientId: googleOAuthCredentials.clientId,
+      clientSecret: googleOAuthCredentials.clientSecret,
+      allowDangerousEmailAccountLinking: true,
       authorization: {
         params: {
           access_type: "offline",
