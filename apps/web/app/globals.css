@@ -1,7 +1,0 @@
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #101114; color: #f6f7f9; font-family: Arial, sans-serif; }
-main { width: min(680px, calc(100% - 48px)); }
-h1 { font-size: clamp(2rem, 7vw, 4rem); margin: 0.2rem 0 1rem; letter-spacing: -0.05em; }
-p { color: #aeb4be; font-size: 1.1rem; }
-.eyebrow { color: #87e8bd; font-size: 0.85rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }

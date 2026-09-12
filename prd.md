@@ -16,6 +16,9 @@ The application should be built with:
 * **Supabase / PostgreSQL**
 * **shadcn/ui**
 * Gmail API / Google OAuth
+* **Python / FastAPI**
+* **LangGraph**
+* **OpenRouter**
 * Encrypted OAuth access and refresh tokens
 * Environment variables for secrets and configuration
 
@@ -212,6 +215,25 @@ Any new migration/schema changes should be clearly documented.
 
 Keep authentication, Gmail API access, token management, and UI concerns separated.
 
+## 9.1 Runtime Responsibilities
+
+### Next.js application
+
+Responsible for the UI, Google sign-in through NextAuth, and establishing the
+authenticated user context. It must call only server-side application endpoints.
+
+### Python agent service
+
+Use FastAPI as the private server-side service that hosts the Gmail agent.
+LangGraph must orchestrate the agent workflow. This service is responsible for
+typed agent state, Gmail tools, OpenRouter model calls, and structured safe
+results. Provider credentials, OAuth refresh tokens, and model calls must never
+reach the browser.
+
+The Next.js application must authenticate the caller before invoking the Python
+service. The Python service must derive or verify user context from this trusted
+server-side request; it must never accept an arbitrary browser-provided `userId`.
+
 Suggested structure:
 
 ```text
@@ -258,7 +280,8 @@ Responsible for:
 * Refreshing access tokens
 * Sending emails
 * Reading emails
-* AI summarization
+* LangGraph workflow execution
+* OpenRouter model calls
 
 The browser must never receive:
 
@@ -589,29 +612,74 @@ A user must only be able to access their own Gmail account.
 
 ---
 
-# 21. AI Layer
+# 21. AI and Agent Layer
 
-Keep the AI implementation separate from Gmail API logic.
+## 21.1 LangGraph
 
-For example:
+Use LangGraph as the orchestration layer for the Python Gmail agent. Model the
+MVP as an explicit, typed graph rather than a free-form autonomous loop.
 
 ```text
-Gmail Service
-     ↓
-Email Content
-     ↓
-AI Service
-     ↓
-Summary
+START
+  ↓
+Load authenticated user context
+  ↓
+Fetch requested Gmail message
+  ↓
+Clean and bound email content
+  ↓
+Generate summary through OpenRouter
+  ↓
+Validate structured result
+  ↓
+END
 ```
 
-Do not tightly couple the AI provider to the Gmail service.
+The agent state must contain only the minimum request data: authenticated user
+ID, message ID, cleaned content, summary result, and safe error state. It must
+never include OAuth tokens, encryption keys, or provider secrets in UI results
+or client-visible logs.
 
-The AI provider/model should be configurable through environment variables where practical.
+Keep Gmail actions as dedicated server-side tools. The LLM must not receive
+unrestricted database access, OAuth credentials, or arbitrary network access.
+Sending email remains a user-initiated server-side operation, not an autonomous
+LangGraph action.
 
-For the MVP, only email summarization is required.
+Design the graph so future tools can be registered without changing token or
+authentication layers. Durable graph persistence, long-term memory, and
+autonomous multi-step actions are out of scope for the MVP.
 
-Do not implement autonomous email actions yet.
+## 21.2 OpenRouter
+
+Use OpenRouter as the model gateway for summarization through its
+OpenAI-compatible API. It must be called only by the Python service.
+
+Model choice must be configurable. Do not hard-code a provider-specific model:
+
+```env
+OPENROUTER_API_KEY=...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=provider/model-name
+```
+
+Never expose `OPENROUTER_API_KEY` to the browser or commit it to source
+control. Do not send more email text to the model than needed for the requested
+summary. Bound input size and return user-friendly errors for unavailable
+providers, invalid model configuration, rate limits, and timeouts.
+
+## 21.3 Summary Contract
+
+For the MVP, only email summarization is required. The LangGraph summary node
+must return a concise, factual result prioritizing:
+
+* Main point
+* Important information
+* Action items
+* Deadlines
+* Decisions and open questions
+
+Do not implement autonomous email actions, automatic sending, reply drafting,
+or background agent runs yet.
 
 ---
 
@@ -622,7 +690,7 @@ Although the MVP only has two capabilities, structure the code so future agent t
 Conceptually:
 
 ```text
-Gmail Agent
+LangGraph Gmail Agent
 │
 ├── Read Email
 ├── Summarize Email
@@ -641,6 +709,16 @@ Future functionality may include:
 ```
 
 Do not implement these future capabilities unless required for the MVP.
+
+## 22.1 Observability
+
+Log only operational metadata needed to diagnose failures, such as request IDs,
+graph node names, durations, and safe error categories. Do not log Gmail bodies,
+OAuth tokens, OpenRouter keys, or decrypted credentials.
+
+Optional LangGraph/LangSmith tracing is disabled by default and must not be
+enabled with production email content until its data-handling settings have been
+reviewed.
 
 ---
 
