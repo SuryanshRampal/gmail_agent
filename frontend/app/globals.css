@@ -39,3 +39,15 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 @media (max-width:700px) { .reader-meta time { display:none; }.message-reader { padding:24px 18px; }.message-reader .email-body { font-size:15px; } }
 .email-frame { display:block; min-height:650px; width:100%; border:0; background:#fff; border-radius:10px; }
 .plain-email { white-space:pre-wrap; overflow-wrap:anywhere; }
+.summary-content { min-width:0; }
+.summary-markdown { color:var(--ivory); line-height:1.6; }
+.summary-markdown > :first-child { margin-top:0; }
+.summary-markdown > :last-child { margin-bottom:0; }
+.summary-markdown p { margin:0 0 14px; }
+.summary-markdown h1,.summary-markdown h2,.summary-markdown h3 { color:var(--ivory); font-weight:600; line-height:1.25; margin:22px 0 10px; }
+.summary-markdown h1 { font-size:24px; }.summary-markdown h2 { font-size:19px; }.summary-markdown h3 { font-size:16px; }
+.summary-markdown ul,.summary-markdown ol { margin:8px 0 16px; padding-left:24px; }
+.summary-markdown li { margin:6px 0; padding-left:3px; }
+.summary-markdown strong { color:white; font-weight:650; }
+.summary-markdown a { color:#aeb8ff; text-decoration:underline; text-underline-offset:3px; }
+.summary-markdown code { border-radius:5px; background:rgb(255 255 255 / .08); padding:2px 5px; font-size:.9em; }

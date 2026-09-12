@@ -1,8 +1,7 @@
 "use client"
 
 import { FilePenLine, Mail, RefreshCw } from "lucide-react"
-import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInput } from "@/components/ui/sidebar"
-import { NavUser } from "@/components/nav-user"
+import { Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInput } from "@/components/ui/sidebar"
 
 type User = { name?: string | null; email?: string | null; image?: string | null }
 type Message = { id: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean }
@@ -27,6 +26,5 @@ export function AppSidebar({ user, view, messages, selectedId, unreadCount, onVi
     <SidebarContent>
       <SidebarGroup className="min-w-0 px-0"><SidebarGroupLabel className="px-5 pt-3 text-[10px] uppercase tracking-[.18em] text-white/45">Messages</SidebarGroupLabel><SidebarGroupContent className="min-w-0">{messages.length === 0 ? <p className="px-5 py-8 text-center text-xs leading-5 text-white/40">Your inbox is clear.</p> : messages.map((message) => <button key={message.id} onClick={() => onSelectMessage(message)} className={`flex w-full min-w-0 flex-col items-start gap-2.5 overflow-hidden border-b border-white/10 px-5 py-4 text-left text-sm leading-tight transition-colors hover:bg-white/8 ${selectedId === message.id ? "bg-white/12" : ""}`}><div className="flex w-full min-w-0 items-center gap-2.5"><span className={`flex size-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${message.isUnread ? "bg-[#6574f5] text-white" : "bg-white/10 text-white/60"}`}>{initial(message.sender)}</span><span className={`min-w-0 flex-1 truncate ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}>{message.sender || "Unknown sender"}</span><span className="shrink-0 text-[11px] text-white/45">{formatDate(message.receivedAt)}</span></div><span className={`w-full min-w-0 truncate pl-9 ${message.isUnread ? "font-medium text-white/95" : "text-white/70"}`}>{message.subject}</span><span className="line-clamp-2 w-full min-w-0 pl-9 text-xs leading-5 text-white/45">{message.snippet}</span></button>)}</SidebarGroupContent></SidebarGroup>
     </SidebarContent>
-    <SidebarFooter className="border-t border-white/15 p-2"><NavUser user={{ name: user.name ?? "User", email: user.email ?? "", avatar: user.image ?? "" }} /></SidebarFooter>
   </Sidebar>
 }
