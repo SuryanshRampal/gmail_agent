@@ -20,8 +20,8 @@ Google OAuth through NextAuth.js.
    authorized JavaScript origin and
    `http://localhost:3000/api/auth/callback/google` as an authorized redirect
    URI. Enable Gmail API and add your account as a test user.
-4. Add `OPENAI_API_KEY` only if you want live AI summaries. The feature gives a
-   clear configuration error until it is set.
+4. Set `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, and the
+   same `AGENT_SERVICE_KEY` in `backend/.env` and `frontend/.env.local`.
 3. Install and run the web app:
 
    ```sh
@@ -35,7 +35,8 @@ Google OAuth through NextAuth.js.
    ```sh
    python3 -m venv backend/.venv
    backend/.venv/bin/pip install -e 'backend[dev]'
-   backend/.venv/bin/uvicorn app.main:app --app-dir backend --reload --port 8000
+   cd backend
+   .venv/bin/uvicorn app.main:app --reload --port 8000
    ```
 
 The web app is available at `http://localhost:3000`; the API health check is

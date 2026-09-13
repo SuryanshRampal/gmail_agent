@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     supabase_publishable_key: str | None = None
     # Server-only: never expose this value to the Next.js client.
     supabase_service_role_key: str | None = None
+    openrouter_api_key: str | None = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_timeout_seconds: float = 30.0
+    max_summary_input_chars: int = 30000
+    agent_service_key: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

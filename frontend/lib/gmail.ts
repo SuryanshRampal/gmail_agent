@@ -9,26 +9,67 @@ export class GmailConnectionError extends Error {}
 export type GmailMessage = { id: string; threadId: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean; body?: string; bodyHtml?: string; bodyText?: string };
 
 type StoredAccount = { access_token: string | null; refresh_token: string | null; expires_at: number | null };
+export type GmailRequestContext = { requestId?: string };
 
-async function getAccessToken(userId: string): Promise<string> {
+function log(context: GmailRequestContext | undefined, message: string, details?: Record<string, unknown>) {
+  console.info(`[gmail] ${message}`, { requestId: context?.requestId, ...details });
+}
+
+function logError(context: GmailRequestContext | undefined, message: string, error: unknown, details?: Record<string, unknown>) {
+  console.error(`[gmail] ${message}`, {
+    requestId: context?.requestId,
+    ...details,
+    error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : error,
+  });
+}
+
+async function getAccessToken(userId: string, context?: GmailRequestContext): Promise<string> {
+  const startedAt = Date.now();
+  log(context, "loading stored Google account", { userId });
   const { rows } = await db.query<StoredAccount>("select access_token, refresh_token, expires_at from next_auth.accounts where \"userId\" = $1 and provider = 'google' order by id desc limit 1", [userId]);
   const account = rows[0];
+  log(context, "stored Google account loaded", { hasAccount: Boolean(account), hasAccessToken: Boolean(account?.access_token), hasRefreshToken: Boolean(account?.refresh_token), expiresAt: account?.expires_at ?? null, durationMs: Date.now() - startedAt });
   if (!account?.access_token) throw new GmailConnectionError("Gmail is not connected.");
-  if (!account.expires_at || account.expires_at > Math.floor(Date.now() / 1000) + 60) return decryptToken(account.access_token);
+  if (!account.expires_at || account.expires_at > Math.floor(Date.now() / 1000) + 60) {
+    try {
+      const token = decryptToken(account.access_token);
+      log(context, "using stored Google access token", { durationMs: Date.now() - startedAt });
+      return token;
+    } catch (error) {
+      logError(context, "failed to decrypt stored Google access token", error);
+      throw error;
+    }
+  }
   if (!account.refresh_token) throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
 
+  log(context, "refreshing expired Google access token");
   const response = await fetch(GOOGLE_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: googleOAuthCredentials.clientId, client_secret: googleOAuthCredentials.clientSecret, grant_type: "refresh_token", refresh_token: decryptToken(account.refresh_token) }), cache: "no-store" });
-  if (!response.ok) throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
+  if (!response.ok) {
+    log(context, "Google token refresh failed", { status: response.status, statusText: response.statusText });
+    throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
+  }
   const token = await response.json() as { access_token: string; expires_in: number };
+  log(context, "Google access token refreshed", { expiresIn: token.expires_in });
   await db.query("update next_auth.accounts set access_token = $1, expires_at = $2 where \"userId\" = $3 and provider = 'google'", [encryptToken(token.access_token), Math.floor(Date.now() / 1000) + token.expires_in, userId]);
   return token.access_token;
 }
 
-async function gmailFetch(userId: string, path: string, init?: RequestInit): Promise<Response> {
-  const token = await getAccessToken(userId);
+async function gmailFetch(userId: string, path: string, init?: RequestInit, context?: GmailRequestContext): Promise<Response> {
+  const startedAt = Date.now();
+  log(context, "calling Gmail API", { method: init?.method ?? "GET", path });
+  const token = await getAccessToken(userId, context);
   const response = await fetch(`${GMAIL_API}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init?.headers }, cache: "no-store" });
+  log(context, "Gmail API responded", { method: init?.method ?? "GET", path, status: response.status, statusText: response.statusText, durationMs: Date.now() - startedAt });
   if (response.status === 401) throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
-  if (!response.ok) throw new Error("Gmail API request failed.");
+  if (!response.ok) {
+    let errorDetails: unknown;
+    try {
+      const payload = await response.clone().json() as { error?: { code?: number; message?: string; status?: string; errors?: Array<{ reason?: string; domain?: string }> } };
+      errorDetails = { error: payload.error };
+    } catch { errorDetails = { responseBody: (await response.clone().text()).slice(0, 500) }; }
+    log(context, "Gmail API request failed", { method: init?.method ?? "GET", path, status: response.status, errorDetails });
+    throw new Error(`Gmail API request failed (${response.status}).`);
+  }
   return response;
 }
 
@@ -41,7 +82,7 @@ function extractBodies(payload: any, result = { html: "", text: "" }) {
   for (const part of payload.parts ?? []) extractBodies(part, result);
   return result;
 }
-async function inlineImages(userId: string, message: any, html: string) {
+async function inlineImages(userId: string, message: any, html: string, context?: GmailRequestContext) {
   if (!html) return html;
   const parts: any[] = [];
   const visit = (part: any) => { if (part.filename && part.body?.attachmentId) parts.push(part); for (const child of part.parts ?? []) visit(child); };
@@ -49,23 +90,53 @@ async function inlineImages(userId: string, message: any, html: string) {
   await Promise.all(parts.map(async (part) => {
     const contentId = header(part.headers, "Content-ID").replace(/[<>]/g, "");
     if (!contentId) return;
-    const attachment = await (await gmailFetch(userId, `/messages/${encodeURIComponent(message.id)}/attachments/${encodeURIComponent(part.body.attachmentId)}`)).json() as { data?: string };
+    const attachment = await (await gmailFetch(userId, `/messages/${encodeURIComponent(message.id)}/attachments/${encodeURIComponent(part.body.attachmentId)}`, undefined, context)).json() as { data?: string };
     if (attachment.data) html = html.replaceAll(`cid:${contentId}`, `data:${part.mimeType};base64,${attachment.data.replace(/-/g, "+").replace(/_/g, "/")}`);
   }));
   return html;
 }
-async function messageFromGoogle(userId: string, message: any, resolveImages = false): Promise<GmailMessage> {
+async function messageFromGoogle(userId: string, message: any, resolveImages = false, context?: GmailRequestContext): Promise<GmailMessage> {
   const labels = message.labelIds ?? [];
   const bodies = extractBodies(message.payload);
-  const bodyHtml = resolveImages ? await inlineImages(userId, message, bodies.html) : bodies.html;
+  const bodyHtml = resolveImages ? await inlineImages(userId, message, bodies.html, context) : bodies.html;
   return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
-export async function getEmails(userId: string): Promise<GmailMessage[]> {
-  const list = await (await gmailFetch(userId, "/messages?maxResults=30&labelIds=INBOX")).json() as { messages?: Array<{ id: string }> };
-  return Promise.all((list.messages ?? []).map(async ({ id }) => messageFromGoogle(userId, await (await gmailFetch(userId, `/messages/${id}?format=full`)).json())));
+export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string };
+
+export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailMessage[]> {
+  const query = range.from && range.to ? `after:${range.from} before:${range.to}` : "newer_than:30d";
+  const ids: Array<{ id: string }> = [];
+  let pageToken = "";
+  do {
+    const params = new URLSearchParams({ maxResults: "500", labelIds: "INBOX", q: query });
+    if (pageToken) params.set("pageToken", pageToken);
+    const list = await (await gmailFetch(userId, `/messages?${params.toString()}`, undefined, context)).json() as { messages?: Array<{ id: string }>; nextPageToken?: string };
+    ids.push(...(list.messages ?? []));
+    pageToken = list.nextPageToken ?? "";
+  } while (pageToken);
+  log(context, "Gmail inbox list parsed", { messageCount: ids.length, query });
+  const emails: GmailMessage[] = [];
+  for (let index = 0; index < ids.length; index += 20) {
+    const batch = ids.slice(index, index + 20);
+    const loaded = await Promise.all(batch.map(async ({ id }) => {
+      try {
+        return messageFromGoogle(userId, await (await gmailFetch(userId, `/messages/${encodeURIComponent(id)}?format=full`, undefined, context)).json(), false, context);
+      } catch (error) {
+        logError(context, "failed to load one inbox message", error, { messageId: id });
+        return null;
+      }
+    }));
+    emails.push(...loaded.filter((email): email is GmailMessage => email !== null));
+  }
+  return emails;
 }
-export async function getEmail(userId: string, messageId: string): Promise<GmailMessage> { return messageFromGoogle(userId, await (await gmailFetch(userId, `/messages/${encodeURIComponent(messageId)}?format=full`)).json(), true); }
+export async function getEmail(userId: string, messageId: string, context?: GmailRequestContext): Promise<GmailMessage> {
+  log(context, "loading Gmail message", { userId, messageId });
+  const message = await (await gmailFetch(userId, `/messages/${encodeURIComponent(messageId)}?format=full`, undefined, context)).json();
+  log(context, "Gmail message payload parsed", { messageId, hasPayload: Boolean(message?.payload), partCount: message?.payload?.parts?.length ?? 0, labelCount: message?.labelIds?.length ?? 0 });
+  return messageFromGoogle(userId, message, true, context);
+}
 export async function sendEmail(userId: string, email: { to: string; subject: string; body: string }) {
   const raw = Buffer.from([`To: ${email.to}`, `Subject: ${email.subject}`, "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", email.body].join("\r\n")).toString("base64url");
   return (await gmailFetch(userId, "/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ raw }) })).json();

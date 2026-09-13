@@ -2,11 +2,24 @@ import { NextResponse } from "next/server";
 
 import { GmailConnectionError, getEmail } from "@/lib/gmail";
 import { requireUserId } from "@/lib/session";
+import { randomUUID } from "crypto";
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
-  try { return NextResponse.json(await getEmail(await requireUserId(), (await params).id)); }
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  const { id } = await params;
+  console.info("[api/gmail/messages/:id] request started", { requestId, messageId: id });
+  const json = (body: unknown, status = 200) => NextResponse.json(body, { status, headers: { "X-Request-Id": requestId } });
+  try {
+    const userId = await requireUserId();
+    const email = await getEmail(userId, id, { requestId });
+    console.info("[api/gmail/messages/:id] request completed", { requestId, messageId: id, durationMs: Date.now() - startedAt });
+    return json(email);
+  }
   catch (error) {
-    if (error instanceof GmailConnectionError) return NextResponse.json({ error: error.message, reconnect: true }, { status: 401 });
-    return NextResponse.json({ error: "We couldn't access this email right now. Please try again." }, { status: 500 });
+    console.error("[api/gmail/messages/:id] request failed", { requestId, messageId: id, durationMs: Date.now() - startedAt, error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : error });
+    if (error instanceof Error && error.message === "UNAUTHORIZED") return json({ error: "Please sign in to continue." }, 401);
+    if (error instanceof GmailConnectionError) return json({ error: error.message, reconnect: true }, 401);
+    return json({ error: "We couldn't access this email right now. Please try again." }, 500);
   }
 }
