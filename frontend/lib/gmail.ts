@@ -105,20 +105,17 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
-export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string };
+export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string };
+export type GmailEmailPage = { messages: GmailMessage[]; nextPageToken?: string; resultSizeEstimate?: number };
 
-export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailMessage[]> {
+export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailEmailPage> {
   const query = range.from && range.to ? `after:${range.from} before:${range.to}` : "newer_than:30d";
   const ids: Array<{ id: string }> = [];
-  let pageToken = "";
-  do {
-    const params = new URLSearchParams({ maxResults: "500", labelIds: "INBOX", q: query });
-    if (pageToken) params.set("pageToken", pageToken);
-    const list = await (await gmailFetch(userId, `/messages?${params.toString()}`, undefined, context)).json() as { messages?: Array<{ id: string }>; nextPageToken?: string };
-    ids.push(...(list.messages ?? []));
-    pageToken = list.nextPageToken ?? "";
-  } while (pageToken);
-  log(context, "Gmail inbox list parsed", { messageCount: ids.length, query });
+  const params = new URLSearchParams({ maxResults: "25", labelIds: "INBOX", q: query });
+  if (range.pageToken) params.set("pageToken", range.pageToken);
+  const list = await (await gmailFetch(userId, `/messages?${params.toString()}`, undefined, context)).json() as { messages?: Array<{ id: string }>; nextPageToken?: string; resultSizeEstimate?: number };
+  ids.push(...(list.messages ?? []));
+  log(context, "Gmail inbox list parsed", { messageCount: ids.length, query, hasNextPage: Boolean(list.nextPageToken), resultSizeEstimate: list.resultSizeEstimate });
   const metadataParams = new URLSearchParams({ format: "metadata" });
   for (const name of ["From", "To", "Subject", "Date"]) metadataParams.append("metadataHeaders", name);
   const emails: GmailMessage[] = [];
@@ -130,7 +127,7 @@ export async function getEmails(userId: string, range: EmailRange = {}, context?
     }));
     emails.push(...loaded);
   }
-  return emails;
+  return { messages: emails, nextPageToken: list.nextPageToken, resultSizeEstimate: list.resultSizeEstimate };
 }
 export async function getEmail(userId: string, messageId: string, context?: GmailRequestContext): Promise<GmailMessage> {
   log(context, "loading Gmail message", { userId, messageId });
