@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.agent import summary_graph
+from app.outbound import create_draft
 from app.config import get_settings
 
 settings = get_settings()
@@ -44,3 +45,23 @@ async def summarize(
         status = 503 if error.startswith("SUMMARY_PROVIDER") else 422
         raise HTTPException(status_code=status, detail=error)
     return {"summary": result["summary"]}
+
+
+class DraftRequest(BaseModel):
+    request: str = Field(min_length=3, max_length=20000)
+
+
+@app.post("/agent/draft")
+async def draft_email(
+    request: DraftRequest,
+    x_agent_key: str | None = Header(default=None),
+    x_user_id: str | None = Header(default=None),
+) -> dict[str, object]:
+    if not settings.agent_service_key or x_agent_key != settings.agent_service_key:
+        raise HTTPException(status_code=401, detail="Unauthorized agent request")
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Missing authenticated user")
+    result = await create_draft(request.request)
+    if isinstance(result, str):
+        return {"clarification": result}
+    return {"draft": result.model_dump()}

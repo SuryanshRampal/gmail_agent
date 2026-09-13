@@ -135,7 +135,8 @@ export async function getEmail(userId: string, messageId: string, context?: Gmai
   log(context, "Gmail message payload parsed", { messageId, hasPayload: Boolean(message?.payload), partCount: message?.payload?.parts?.length ?? 0, labelCount: message?.labelIds?.length ?? 0 });
   return messageFromGoogle(userId, message, true, context);
 }
-export async function sendEmail(userId: string, email: { to: string; subject: string; body: string }) {
-  const raw = Buffer.from([`To: ${email.to}`, `Subject: ${email.subject}`, "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", email.body].join("\r\n")).toString("base64url");
+export async function sendEmail(userId: string, email: { to: string; subject: string; body: string }, idempotencyKey?: string) {
+  const messageId = idempotencyKey ? `<gmail-agent-${idempotencyKey}@localhost>` : undefined;
+  const raw = Buffer.from([`To: ${email.to}`, `Subject: ${email.subject}`, ...(messageId ? [`Message-ID: ${messageId}`] : []), "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", email.body].join("\r\n")).toString("base64url");
   return (await gmailFetch(userId, "/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ raw }) })).json();
 }
