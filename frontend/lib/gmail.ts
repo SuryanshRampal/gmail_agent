@@ -58,19 +58,22 @@ async function gmailFetch(userId: string, path: string, init?: RequestInit, cont
   const startedAt = Date.now();
   log(context, "calling Gmail API", { method: init?.method ?? "GET", path });
   const token = await getAccessToken(userId, context);
-  const response = await fetch(`${GMAIL_API}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init?.headers }, cache: "no-store" });
-  log(context, "Gmail API responded", { method: init?.method ?? "GET", path, status: response.status, statusText: response.statusText, durationMs: Date.now() - startedAt });
-  if (response.status === 401) throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
-  if (!response.ok) {
-    let errorDetails: unknown;
-    try {
-      const payload = await response.clone().json() as { error?: { code?: number; message?: string; status?: string; errors?: Array<{ reason?: string; domain?: string }> } };
-      errorDetails = { error: payload.error };
-    } catch { errorDetails = { responseBody: (await response.clone().text()).slice(0, 500) }; }
-    log(context, "Gmail API request failed", { method: init?.method ?? "GET", path, status: response.status, errorDetails });
-    throw new Error(`Gmail API request failed (${response.status}).`);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const response = await fetch(`${GMAIL_API}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init?.headers }, cache: "no-store" });
+    log(context, "Gmail API responded", { method: init?.method ?? "GET", path, status: response.status, statusText: response.statusText, durationMs: Date.now() - startedAt, attempt: attempt + 1 });
+    if (response.status === 401) throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
+    if (response.ok) return response;
+
+    let payload: { error?: { code?: number; message?: string; status?: string; errors?: Array<{ reason?: string; domain?: string }> } } = {};
+    try { payload = await response.clone().json(); } catch { /* Keep the HTTP status when Gmail returns no JSON. */ }
+    const reasons = payload.error?.errors?.map((item) => item.reason).filter(Boolean) ?? [];
+    const retryable = response.status === 429 || response.status === 500 || response.status === 503 || (response.status === 403 && reasons.some((reason) => reason === "userRateLimitExceeded" || reason === "rateLimitExceeded" || reason === "backendError"));
+    log(context, "Gmail API request failed", { method: init?.method ?? "GET", path, status: response.status, errorDetails: payload.error, retryable, attempt: attempt + 1 });
+    if (!retryable || attempt === 4) throw new Error(`Gmail API request failed (${response.status})${payload.error?.message ? `: ${payload.error.message}` : "."}`);
+    const retryAfter = Number(response.headers.get("retry-after"));
+    await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500 * (attempt + 1)));
   }
-  return response;
+  throw new Error("Gmail API request failed.");
 }
 
 function header(headers: Array<{ name: string; value: string }> | undefined, name: string) { return headers?.find((item) => item.name.toLowerCase() === name.toLowerCase())?.value ?? ""; }
@@ -116,18 +119,16 @@ export async function getEmails(userId: string, range: EmailRange = {}, context?
     pageToken = list.nextPageToken ?? "";
   } while (pageToken);
   log(context, "Gmail inbox list parsed", { messageCount: ids.length, query });
+  const metadataParams = new URLSearchParams({ format: "metadata" });
+  for (const name of ["From", "To", "Subject", "Date"]) metadataParams.append("metadataHeaders", name);
   const emails: GmailMessage[] = [];
-  for (let index = 0; index < ids.length; index += 20) {
-    const batch = ids.slice(index, index + 20);
+  for (let index = 0; index < ids.length; index += 2) {
+    const batch = ids.slice(index, index + 2);
     const loaded = await Promise.all(batch.map(async ({ id }) => {
-      try {
-        return messageFromGoogle(userId, await (await gmailFetch(userId, `/messages/${encodeURIComponent(id)}?format=full`, undefined, context)).json(), false, context);
-      } catch (error) {
-        logError(context, "failed to load one inbox message", error, { messageId: id });
-        return null;
-      }
+      const response = await gmailFetch(userId, `/messages/${encodeURIComponent(id)}?${metadataParams.toString()}`, undefined, context);
+      return messageFromGoogle(userId, await response.json(), false, context);
     }));
-    emails.push(...loaded.filter((email): email is GmailMessage => email !== null));
+    emails.push(...loaded);
   }
   return emails;
 }
