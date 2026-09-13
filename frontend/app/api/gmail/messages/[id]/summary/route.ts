@@ -13,7 +13,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     const response = await fetch(`${(process.env.AGENT_API_URL ?? "http://localhost:8000").replace(/\/$/, "")}/agent/summarize`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Agent-Key": agentKey, "X-User-Id": userId },
-      body: JSON.stringify({ message_id: messageId, content: email.body ?? email.snippet }),
+      body: JSON.stringify({ message_id: messageId, content: `Subject: ${email.subject}\nFrom: ${email.sender}\nTo: ${email.recipients}\n\n${email.body ?? email.snippet}` }),
       cache: "no-store",
     });
     const data = await response.json() as { summary?: string; detail?: string };

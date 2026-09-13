@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from typing import Literal, TypedDict
 
@@ -11,6 +13,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 
 class AgentState(TypedDict, total=False):
     user_id: str
@@ -53,28 +56,48 @@ async def generate_summary(state: AgentState) -> AgentState:
     if not settings.openrouter_api_key:
         return {"error": "SUMMARY_PROVIDER_NOT_CONFIGURED"}
     prompt = (
-        "Summarize this email factually and concisely. Prioritize the main point, "
-        "important information, action items, deadlines, decisions, and open "
-        "questions. Do not invent details. Preserve source hyperlinks as Markdown "
-        "links. Return only the summary text.\n\nEmail:\n" + state["cleaned_content"]
+        "You are the intelligence layer of a premium email client. Turn the email below "
+        "into a polished, decision-ready briefing. Write clear, useful Markdown—not a "
+        "generic one-sentence paraphrase.\n\n"
+        "Use these sections in this exact order:\n"
+        "## At a glance\n"
+        "Write 1–2 sentences explaining what this is and why it matters to the recipient.\n\n"
+        "## Key details\n"
+        "Give 2–5 concise bullets. Extract concrete products, amounts, conditions, links, "
+        "or notable details when present.\n\n"
+        "## Recommended next step\n"
+        "State the clearest action. If no action is required, say so directly.\n\n"
+        "## Dates & terms\n"
+        "List deadlines, expiry dates, eligibility, subscription, delivery, or other terms. "
+        "If none are stated, write `- No deadline or special terms stated.`\n\n"
+        "Rules: use only facts in the email; never invent prices, deadlines, or urgency. "
+        "For promotional emails, distinguish the offer from its conditions. Preserve useful "
+        "source hyperlinks as Markdown links. Keep the entire brief under 220 words and "
+        "return only the Markdown briefing.\n\nEmail:\n" + state["cleaned_content"]
     )
+    headers = {
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": settings.allowed_origins[0] if settings.allowed_origins else "http://localhost:3000",
+        "X-Title": "Gmail Agent",
+    }
+    payload = {"model": settings.openrouter_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
     try:
         async with httpx.AsyncClient(timeout=settings.openrouter_timeout_seconds) as client:
-            response = await client.post(
-                f"{settings.openrouter_base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.openrouter_api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": settings.allowed_origins[0] if settings.allowed_origins else "http://localhost:3000",
-                    "X-Title": "Gmail Agent",
-                },
-                json={"model": settings.openrouter_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2},
-            )
-        response.raise_for_status()
-        text = response.json()["choices"][0]["message"]["content"].strip()
-        return {"summary": SummaryResult(summary=text).summary}
-    except (httpx.HTTPError, KeyError, IndexError, TypeError, AttributeError, ValidationError):
-        return {"error": "SUMMARY_PROVIDER_UNAVAILABLE"}
+            for attempt in range(3):
+                response = await client.post(f"{settings.openrouter_base_url.rstrip('/')}/chat/completions", headers=headers, json=payload)
+                if response.is_success:
+                    text = response.json()["choices"][0]["message"]["content"].strip()
+                    return {"summary": SummaryResult(summary=text).summary}
+                retryable = response.status_code in {408, 409, 429, 500, 502, 503, 504}
+                logger.warning("Summary provider rejected request: status=%s attempt=%s model=%s response=%s", response.status_code, attempt + 1, settings.openrouter_model, response.text[:1000])
+                if not retryable or attempt == 2:
+                    return {"error": "SUMMARY_PROVIDER_UNAVAILABLE"}
+                retry_after = response.headers.get("retry-after")
+                await asyncio.sleep(float(retry_after) if retry_after and retry_after.isdigit() else 1 + attempt)
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, AttributeError, ValidationError) as error:
+        logger.exception("Summary provider request failed: type=%s model=%s", type(error).__name__, settings.openrouter_model)
+    return {"error": "SUMMARY_PROVIDER_UNAVAILABLE"}
 
 
 def validate_result(state: AgentState) -> AgentState:
