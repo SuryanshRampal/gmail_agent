@@ -105,13 +105,30 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
-export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string };
+export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string };
 export type GmailEmailPage = { messages: GmailMessage[]; nextPageToken?: string; resultSizeEstimate?: number };
 
+function gmailPhrase(value: string) { return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`; }
+export function expandGmailSearch(value: string): string {
+  const input = value.trim();
+  if (!input) return "";
+  const variants = new Set<string>([input]);
+  const normalized = input.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
+  if (normalized !== input) variants.add(gmailPhrase(normalized));
+  const compact = normalized.replace(/\s/g, "");
+  if (compact.length >= 5 && compact !== input) variants.add(compact);
+  if (/^[a-z0-9]+$/i.test(compact) && compact.length >= 5) {
+    for (let index = 2; index <= compact.length - 2 && variants.size < 10; index += 1) variants.add(gmailPhrase(`${compact.slice(0, index)} ${compact.slice(index)}`));
+  }
+  return variants.size === 1 ? input : `{${[...variants].join(" ")}}`;
+}
+
 export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailEmailPage> {
-  const query = range.from && range.to ? `after:${range.from} before:${range.to}` : "newer_than:30d";
+  const search = range.search?.trim();
+  const query = search ? expandGmailSearch(search) : range.from && range.to ? `after:${range.from} before:${range.to}` : "newer_than:30d";
   const ids: Array<{ id: string }> = [];
-  const params = new URLSearchParams({ maxResults: "25", labelIds: "INBOX", q: query });
+  const params = new URLSearchParams({ maxResults: "25", q: search ? `in:anywhere ${query}` : query });
+  if (!search) params.set("labelIds", "INBOX");
   if (range.pageToken) params.set("pageToken", range.pageToken);
   const list = await (await gmailFetch(userId, `/messages?${params.toString()}`, undefined, context)).json() as { messages?: Array<{ id: string }>; nextPageToken?: string; resultSizeEstimate?: number };
   ids.push(...(list.messages ?? []));

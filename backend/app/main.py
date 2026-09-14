@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from app.agent import summary_graph
 from app.outbound import create_draft
+from app.guardrails import MessageEnvelope, preflight
 from app.config import get_settings
 
 settings = get_settings()
@@ -49,6 +50,24 @@ async def summarize(
 
 class DraftRequest(BaseModel):
     request: str = Field(min_length=3, max_length=20000)
+
+
+class PreflightRequest(MessageEnvelope):
+    pass
+
+
+@app.post("/agent/preflight")
+async def preflight_message(
+    request: PreflightRequest,
+    x_agent_key: str | None = Header(default=None),
+    x_user_id: str | None = Header(default=None),
+) -> dict[str, object]:
+    if not settings.agent_service_key or x_agent_key != settings.agent_service_key:
+        raise HTTPException(status_code=401, detail="Unauthorized agent request")
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Missing authenticated user")
+    result = await preflight(x_user_id, request)
+    return {"result": result.model_dump()}
 
 
 @app.post("/agent/draft")

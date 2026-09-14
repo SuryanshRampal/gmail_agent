@@ -2,11 +2,13 @@ import { NextResponse } from "next/server";
 
 import { GmailConnectionError, getEmail } from "@/lib/gmail";
 import { requireUserId } from "@/lib/session";
+import { validatePermission } from "@/lib/message-permission";
 
-export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const userId = await requireUserId();
     const messageId = (await params).id;
+    if (!validatePermission(userId, messageId, request.headers.get("x-message-permission"))) return NextResponse.json({ error: "Permission is required before summarizing this message.", permissionRequired: true }, { status: 403 });
     const email = await getEmail(userId, messageId);
     const agentKey = process.env.AGENT_SERVICE_KEY;
     if (!agentKey) throw new Error("The agent service is not configured.");

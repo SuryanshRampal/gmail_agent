@@ -2,9 +2,10 @@ import { NextResponse } from "next/server";
 
 import { GmailConnectionError, getEmail } from "@/lib/gmail";
 import { requireUserId } from "@/lib/session";
+import { validatePermission } from "@/lib/message-permission";
 import { randomUUID } from "crypto";
 
-export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const requestId = randomUUID();
   const startedAt = Date.now();
   const { id } = await params;
@@ -12,6 +13,9 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const json = (body: unknown, status = 200) => NextResponse.json(body, { status, headers: { "X-Request-Id": requestId } });
   try {
     const userId = await requireUserId();
+    const permission = request.headers.get("x-message-permission");
+    if (!permission) return json({ error: "Permission is required before opening this message.", permissionRequired: true }, 403);
+    if (!validatePermission(userId, id, permission)) return json({ error: "Message permission is invalid or expired.", permissionRequired: true }, 403);
     const email = await getEmail(userId, id, { requestId });
     console.info("[api/gmail/messages/:id] request completed", { requestId, messageId: id, durationMs: Date.now() - startedAt });
     return json(email);

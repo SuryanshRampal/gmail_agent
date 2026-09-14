@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: float = 30.0
     max_summary_input_chars: int = 30000
     agent_service_key: str | None = None
+    sensitivity_model: str = "valhalla/distilbart-mnli-12-1"
+    sensitivity_model_local_only: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
