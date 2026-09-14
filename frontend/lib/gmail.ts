@@ -105,7 +105,7 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
-export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string };
+export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string; allTime?: boolean };
 export type GmailEmailPage = { messages: GmailMessage[]; nextPageToken?: string; resultSizeEstimate?: number };
 
 function gmailPhrase(value: string) { return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`; }
@@ -125,7 +125,7 @@ export function expandGmailSearch(value: string): string {
 
 export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailEmailPage> {
   const search = range.search?.trim();
-  const query = search ? expandGmailSearch(search) : range.from && range.to ? `after:${range.from} before:${range.to}` : "newer_than:30d";
+  const query = search ? expandGmailSearch(search) : range.from && range.to ? `after:${range.from} before:${range.to}` : range.allTime ? "" : "newer_than:30d";
   const ids: Array<{ id: string }> = [];
   const params = new URLSearchParams({ maxResults: "25", q: search ? `in:anywhere ${query}` : query });
   if (!search) params.set("labelIds", "INBOX");
