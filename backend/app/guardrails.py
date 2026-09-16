@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import get_settings
+from app.phishing import PhishingAssessment, assess_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +25,18 @@ class MessageEnvelope(BaseModel):
     subject: str = Field(default="", max_length=2000)
     snippet: str = Field(default="", max_length=6000)
     received_at: str = Field(default="", max_length=200)
+    reply_to: str = Field(default="", max_length=1000)
+    return_path: str = Field(default="", max_length=1000)
+    authentication_results: str = Field(default="", max_length=4000)
+    labels: list[str] = Field(default_factory=list, max_length=50)
 
 
 class SensitivityResult(BaseModel):
     categories: list[Category] = Field(default_factory=list)
     confidence_band: Literal["low", "medium", "high"] = "low"
     decision: Decision = "permission_required"
-    warning: str = "Unable to assess this message safely. Permission is required before opening it."
+    warning: str = "This message could contain sensitive information, but we couldn't determine its category safely. Permission is required before opening its contents."
+    phishing: PhishingAssessment = Field(default_factory=PhishingAssessment)
 
 
 class GuardrailState(TypedDict, total=False):
@@ -54,6 +60,7 @@ def _classifier():
 
 def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
     text = f"From: {envelope.sender}\nSubject: {envelope.subject}\nSnippet: {envelope.snippet}"[:6000]
+    phishing = assess_envelope(sender=envelope.sender, reply_to=envelope.reply_to, authentication_results=envelope.authentication_results, subject=envelope.subject, snippet=envelope.snippet)
     # Keep obvious marketing mail usable while the local model is warming up or unavailable.
     # This is intentionally narrow and never overrides a high-risk signal.
     promotional = re.search(r"\b(sale|offer|discount|coupon|cashback|deal|newsletter|marketing|sponsored|unsubscribe|limited time|breaking news|daily briefing|weekly digest|recommendations?|new releases?|save up to|flight deals?|travel deals?|booking deals?)\b", text, re.I)
@@ -66,30 +73,52 @@ def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
     # and booking/transaction language are the meaningful escalation signals.
     if sensitive_hint:
         categories = (["financial"] if financial_hint else []) + (["medical"] if medical_hint else []) + (["personal"] if personal_hint else [])
-        return SensitivityResult(categories=categories, confidence_band="high", decision="permission_required", warning="This message may contain personal, financial, medical, booking, or security information. Review permission before opening its contents.")
+        return SensitivityResult(categories=categories, confidence_band="high", decision="permission_required", warning="This message may contain personal, financial, medical, booking, or security information. Review permission before opening its contents.", phishing=phishing)
     if promotional or recognized_sender:
-        return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="")
+        if phishing.risk_level == "low_risk":
+            return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="", phishing=phishing)
+        if phishing.risk_level == "needs_attention":
+            return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="allow", warning="", phishing=phishing)
+        return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="permission_required", warning="This message may contain phishing indicators. Review the security warning before opening its contents.", phishing=phishing)
     labels = {
         "financial": "financial or banking information",
         "medical": "medical or health information",
         "personal": "personal identity or private information",
         "uncertain": "sensitive information that needs user review",
     }
-    output = _classifier()(text, candidate_labels=list(labels.values()), multi_label=True)
+    output = _classifier()(text, candidate_labels=[*labels.values(), "phishing or social engineering language"], multi_label=True)
     scores = dict(zip(output["labels"], output["scores"], strict=False))
-    selected = [category for category, label in labels.items() if scores.get(label, 0) >= 0.55]
-    top_score = max(scores.values(), default=0.0)
-    if top_score < 0.4:
-        return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="")
+    model_phishing_score = scores.get("phishing or social engineering language", 0.0)
+    other_model_scores = [score for label, score in scores.items() if label != "phishing or social engineering language"]
+    phishing_margin = model_phishing_score - max(other_model_scores, default=0.0)
+    if phishing.risk_level == "low_risk" and model_phishing_score >= 0.9 and phishing_margin >= 0.15:
+        phishing = PhishingAssessment(risk_level="needs_attention", confidence_band="high", reasons=["The message language resembles a social-engineering or impersonation attempt."], link_count=phishing.link_count, bounded=True)
+    sensitivity_scores = {label: scores.get(label, 0.0) for label in labels.values()}
+    selected = [category for category, label in labels.items() if sensitivity_scores[label] >= 0.72]
+    ordered_sensitivity_scores = sorted(sensitivity_scores.values(), reverse=True)
+    top_score = ordered_sensitivity_scores[0] if ordered_sensitivity_scores else 0.0
+    sensitivity_margin = top_score - (ordered_sensitivity_scores[1] if len(ordered_sensitivity_scores) > 1 else 0.0)
+    if len(selected) == 1 and sensitivity_margin < 0.12:
+        selected = []
+    if top_score < 0.72 or not selected:
+        if phishing.risk_level == "low_risk":
+            return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="", phishing=phishing)
+        if phishing.risk_level == "needs_attention":
+            return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="allow", warning="", phishing=phishing)
+        return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="permission_required", warning="This message may contain phishing indicators. Review the security warning before opening its contents.", phishing=phishing)
     confidence_band = "high" if top_score >= 0.75 else "medium" if top_score >= 0.55 else "low"
     if "uncertain" in selected or confidence_band == "low":
         selected = ["uncertain"]
     category_text = ", ".join(selected)
+    decision = "permission_required" if phishing.risk_level != "low_risk" else "permission_required"
+    warning = f"This message may contain {category_text} information. Review permission before opening its contents."
+    if phishing.risk_level != "low_risk": warning += " It also contains possible phishing indicators."
     return SensitivityResult(
         categories=selected,
         confidence_band=confidence_band,
-        decision="permission_required",
-        warning=f"This message may contain {category_text} information. Review permission before opening its contents.",
+        decision=decision,
+        warning=warning,
+        phishing=phishing,
     )
 
 
@@ -110,7 +139,7 @@ def classify(state: GuardrailState) -> GuardrailState:
 def validate_result(state: GuardrailState) -> GuardrailState:
     try:
         result = SensitivityResult.model_validate(state.get("result"))
-        if result.decision == "allow" and result.categories:
+        if result.decision == "allow" and (result.categories or result.phishing.risk_level in {"high_risk", "unable_to_verify"}):
             return {"result": SensitivityResult()}
         return {"result": result}
     except ValidationError:

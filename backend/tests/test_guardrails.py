@@ -71,3 +71,14 @@ def test_classifier_failure_requires_permission_without_logging_content(monkeypa
     assert result.decision == "permission_required"
     assert result.categories == []
     assert secret not in caplog.text
+
+
+def test_ambiguous_sensitivity_prediction_does_not_prompt(monkeypatch):
+    monkeypatch.setattr(guardrails, "_classifier", lambda: lambda *_args, **_kwargs: {
+        "labels": ["financial or banking information", "medical or health information", "personal identity or private information", "sensitive information that needs user review", "phishing or social engineering language"],
+        "scores": [0.61, 0.58, 0.54, 0.52, 0.11],
+    })
+    result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id="m-ambiguous", subject="Your regular update")))
+    assert result.decision == "allow"
+    assert result.categories == []
+    assert result.phishing.risk_level == "low_risk"

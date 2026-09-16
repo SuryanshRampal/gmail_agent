@@ -6,7 +6,7 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 export class GmailConnectionError extends Error {}
-export type GmailMessage = { id: string; threadId: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean; body?: string; bodyHtml?: string; bodyText?: string };
+export type GmailMessage = { id: string; threadId: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean; replyTo?: string; returnPath?: string; authenticationResults?: string; body?: string; bodyHtml?: string; bodyText?: string };
 
 type StoredAccount = { access_token: string | null; refresh_token: string | null; expires_at: number | null };
 export type GmailRequestContext = { requestId?: string };
@@ -102,7 +102,7 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   const labels = message.labelIds ?? [];
   const bodies = extractBodies(message.payload);
   const bodyHtml = resolveImages ? await inlineImages(userId, message, bodies.html, context) : bodies.html;
-  return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
+  return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), replyTo: header(message.payload?.headers, "Reply-To"), returnPath: header(message.payload?.headers, "Return-Path"), authenticationResults: header(message.payload?.headers, "Authentication-Results"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
 export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string; allTime?: boolean };
@@ -134,7 +134,7 @@ export async function getEmails(userId: string, range: EmailRange = {}, context?
   ids.push(...(list.messages ?? []));
   log(context, "Gmail inbox list parsed", { messageCount: ids.length, query, hasNextPage: Boolean(list.nextPageToken), resultSizeEstimate: list.resultSizeEstimate });
   const metadataParams = new URLSearchParams({ format: "metadata" });
-  for (const name of ["From", "To", "Subject", "Date"]) metadataParams.append("metadataHeaders", name);
+  for (const name of ["From", "To", "Subject", "Date", "Reply-To", "Return-Path", "Authentication-Results"]) metadataParams.append("metadataHeaders", name);
   const emails: GmailMessage[] = [];
   for (let index = 0; index < ids.length; index += 2) {
     const batch = ids.slice(index, index + 2);
