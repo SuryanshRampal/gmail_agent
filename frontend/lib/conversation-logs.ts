@@ -5,7 +5,7 @@ export type ConversationLog = {
   sessionId: string;
   uuid: string;
   parentUuid: string | null;
-  message: { role: "user" | "assistant"; content: string };
+  message: { role: "user" | "assistant"; content: string | Record<string, unknown> };
 };
 
 export async function insertConversationLog(userId: string, log: ConversationLog): Promise<void> {

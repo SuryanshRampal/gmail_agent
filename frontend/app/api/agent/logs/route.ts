@@ -11,7 +11,7 @@ const logSchema = z.object({
   parentUuid: z.string().uuid().nullable(),
   message: z.object({
     role: z.enum(["user", "assistant"]),
-    content: z.string().trim().min(1).max(100000),
+    content: z.union([z.string().trim().min(1).max(100000), z.record(z.string(), z.unknown())]),
   }),
 }).superRefine((value, context) => {
   if (value.type !== value.message.role) context.addIssue({ code: "custom", path: ["message", "role"], message: "Message role must match log type." });
