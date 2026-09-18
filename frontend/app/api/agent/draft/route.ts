@@ -22,14 +22,14 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const userId = await requireUserId();
-    const body = await request.json() as { request?: string };
+    const body = await request.json() as { request?: string; context?: string };
     if (!body.request?.trim()) return NextResponse.json({ error: "Tell the agent what email to write." }, { status: 400 });
     const agentKey = process.env.AGENT_SERVICE_KEY;
     if (!agentKey) return NextResponse.json({ error: "The agent service is not configured." }, { status: 503 });
     const response = await fetch(`${(process.env.AGENT_API_URL ?? "http://localhost:8000").replace(/\/$/, "")}/agent/draft`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Agent-Key": agentKey, "X-User-Id": userId },
-      body: JSON.stringify({ request: body.request }),
+      body: JSON.stringify({ request: body.request, context: body.context?.slice(0, 30000) }),
       cache: "no-store",
     });
     const data = await response.json() as { draft?: object; clarification?: string; detail?: string };

@@ -1,4 +1,5 @@
 import { db } from "@/lib/db";
+import { invalidateConversationCache } from "@/lib/redis-cache";
 
 export type ConversationLog = {
   type: "user" | "assistant";
@@ -13,4 +14,5 @@ export async function insertConversationLog(userId: string, log: ConversationLog
     `insert into logs.conversation_events ("UUID", "SessionID", "UserID", "Logs") values ($1, $2, $3, $4::jsonb)`,
     [log.uuid, log.sessionId, userId, JSON.stringify(log)],
   );
+  await invalidateConversationCache(userId, log.sessionId);
 }

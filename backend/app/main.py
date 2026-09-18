@@ -50,6 +50,7 @@ async def summarize(
 
 class DraftRequest(BaseModel):
     request: str = Field(min_length=3, max_length=20000)
+    context: str = Field(default="", max_length=30000)
 
 
 class PreflightRequest(MessageEnvelope):
@@ -80,7 +81,7 @@ async def draft_email(
         raise HTTPException(status_code=401, detail="Unauthorized agent request")
     if not x_user_id:
         raise HTTPException(status_code=401, detail="Missing authenticated user")
-    result = await create_draft(request.request)
+    result = await create_draft(request.request, request.context)
     if isinstance(result, str):
         return {"clarification": result}
     return {"draft": result.model_dump()}

@@ -4,9 +4,12 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { insertConversationLog } from "@/lib/conversation-logs";
 import { requireUserId } from "@/lib/session";
+import { clearConversationState, getCached, getConversationState, setCached, setConversationState } from "@/lib/redis-cache";
+import { GmailConnectionError, sendEmail } from "@/lib/gmail";
 
 const contentSchema = z.union([z.string().trim().min(1).max(100000), z.record(z.string(), z.unknown())]);
 const continueSchema = z.object({ content: contentSchema });
+type ConversationState = { intent: "send_email" | "draft_email"; status: "collecting" | "ready" | "completed"; draft?: { to: string; subject: string; body: string } };
 
 async function getSessionId(params: Promise<{ sessionId: string }>): Promise<string> {
   const sessionId = (await params).sessionId;
@@ -18,14 +21,24 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
   try {
     const userId = await requireUserId();
     const sessionId = await getSessionId(params);
+    const url = new URL(_request.url);
+    const page = Math.max(0, Number.parseInt(url.searchParams.get("page") ?? "0", 10) || 0);
+    const limit = Math.min(15, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "15", 10) || 15));
+    const cacheKey = `conversations:events:${userId}:${sessionId}:${page}`;
+    const cached = await getCached<{ sessionId: string; events: unknown[]; hasMore: boolean; nextPage: number | null }>(cacheKey);
+    if (cached) return NextResponse.json(cached);
     const result = await db.query(`
       select "UUID" as "uuid", "SessionID" as "sessionId", "Logs" as "log", created_at as "createdAt"
       from logs.conversation_events
       where "UserID" = $1 and "SessionID" = $2
-      order by created_at asc, "UUID" asc
-    `, [userId, sessionId]);
+      order by created_at desc, "UUID" desc
+      limit $3 offset $4
+    `, [userId, sessionId, limit + 1, page * limit]);
     if (result.rowCount === 0) return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
-    return NextResponse.json({ sessionId, events: result.rows });
+    const hasMore = result.rows.length > limit;
+    const payload = { sessionId, events: result.rows.slice(0, limit).reverse(), hasMore, nextPage: hasMore ? page + 1 : null };
+    await setCached(cacheKey, payload, 60);
+    return NextResponse.json(payload);
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });
     if (error instanceof Error && error.message === "INVALID_SESSION_ID") return NextResponse.json({ error: "Invalid conversation ID." }, { status: 400 });
@@ -46,9 +59,67 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
       limit 1
     `, [userId, sessionId]);
     if (latest.rowCount === 0) return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
-    const log = { type: "user" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: latest.rows[0].uuid, message: { role: "user" as const, content: input.content } };
-    await insertConversationLog(userId, log);
-    return NextResponse.json({ event: log }, { status: 201 });
+    const userLog = { type: "user" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: latest.rows[0].uuid, message: { role: "user" as const, content: input.content } };
+    await insertConversationLog(userId, userLog);
+
+    const contextResult = await db.query<{ log: unknown }>(`
+      select "Logs" as log
+      from logs.conversation_events
+      where "UserID" = $1 and "SessionID" = $2
+      order by created_at desc, "UUID" desc
+      limit 15
+    `, [userId, sessionId]);
+    const context = contextResult.rows.reverse().map((row) => JSON.stringify(row.log)).join("\n").slice(0, 30000);
+    const requestText = typeof input.content === "string" ? input.content : JSON.stringify(input.content);
+    const savedState = await getConversationState<ConversationState>(userId, sessionId);
+    const agentKey = process.env.AGENT_SERVICE_KEY;
+    if (!agentKey) return NextResponse.json({ error: "The agent service is not configured.", events: [userLog] }, { status: 503 });
+    const agentResponse = await fetch(`${(process.env.AGENT_API_URL ?? "http://localhost:8000").replace(/\/$/, "")}/agent/draft`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agent-Key": agentKey, "X-User-Id": userId },
+      body: JSON.stringify({ request: requestText, context }),
+      cache: "no-store",
+    });
+    const agentData = await agentResponse.json() as { draft?: object; clarification?: string; detail?: string };
+    if (!agentResponse.ok) {
+      const message = agentData.detail ?? "The drafting agent failed.";
+      const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: message } } };
+      await insertConversationLog(userId, errorLog);
+      return NextResponse.json({ error: message, events: [userLog, errorLog] }, { status: 502 });
+    }
+    const assistantContent: string | Record<string, unknown> = agentData.draft ? agentData.draft as Record<string, unknown> : agentData.clarification ?? "The agent did not return a response.";
+    const sendContext = `${context}\n${requestText}`;
+    const wantsToSend = savedState?.intent === "send_email" || (/\b(send|send out|send another)\b/i.test(sendContext) && !/\b(draft only|just draft|do not send|don't send)\b/i.test(sendContext));
+    if (wantsToSend && !agentData.draft) await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "collecting" });
+    if (wantsToSend && agentData.draft && typeof agentData.draft === "object") {
+      const draft = agentData.draft as { to?: unknown; subject?: unknown; body?: unknown };
+      if (typeof draft.to !== "string" || typeof draft.subject !== "string" || typeof draft.body !== "string") {
+        const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: "The agent returned an incomplete email draft, so it was not sent." } } };
+        await insertConversationLog(userId, errorLog);
+        await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "ready" });
+        return NextResponse.json({ events: [userLog, errorLog], error: "The agent returned an incomplete email draft, so it was not sent." }, { status: 422 });
+      }
+      const to = draft.to as string;
+      const subject = draft.subject as string;
+      const body = draft.body as string;
+      try {
+        await sendEmail(userId, { to, subject, body }, crypto.randomUUID());
+        const sentLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: `Email sent successfully to ${to}.` } };
+        await insertConversationLog(userId, sentLog);
+        await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "completed", draft: { to, subject, body } });
+        return NextResponse.json({ events: [userLog, sentLog] }, { status: 201 });
+      } catch (error) {
+        const message = error instanceof GmailConnectionError ? error.message : "We couldn't send this email.";
+        const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: message } } };
+        await insertConversationLog(userId, errorLog);
+        await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "ready", draft: { to, subject, body } });
+        return NextResponse.json({ events: [userLog, errorLog], error: message }, { status: 502 });
+      }
+    }
+    const assistantLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: assistantContent } };
+    await insertConversationLog(userId, assistantLog);
+    if (wantsToSend && agentData.draft) await clearConversationState(userId, sessionId);
+    return NextResponse.json({ events: [userLog, assistantLog] }, { status: 201 });
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });
     if (error instanceof Error && error.message === "INVALID_SESSION_ID") return NextResponse.json({ error: "Invalid conversation ID." }, { status: 400 });
