@@ -86,6 +86,14 @@ def test_missing_recipient_returns_clarification_without_sendable_draft():
     assert "recipient" in result.lower()
 
 
+def test_vague_length_feedback_does_not_invent_a_new_email():
+    result = asyncio.run(outbound.create_draft("This is a very short email."))
+
+    assert isinstance(result, str)
+    assert "purpose" in result.lower()
+    assert FakeClient.requests == []
+
+
 def test_provider_rate_limit_retries_then_succeeds():
     FakeClient.responses.extend([
         FakeResponse(429, {"error": "rate limited"}),

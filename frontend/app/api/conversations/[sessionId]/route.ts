@@ -8,8 +8,8 @@ import { clearConversationState, getCached, getConversationState, setCached, set
 import { GmailConnectionError, sendEmail } from "@/lib/gmail";
 
 const contentSchema = z.union([z.string().trim().min(1).max(100000), z.record(z.string(), z.unknown())]);
-const continueSchema = z.object({ content: contentSchema });
-type ConversationState = { intent: "send_email" | "draft_email"; status: "collecting" | "ready" | "completed"; draft?: { to: string; subject: string; body: string } };
+const continueSchema = z.object({ content: contentSchema, confirm: z.boolean().optional() });
+type ConversationState = { intent: "send_email" | "draft_email"; status: "collecting" | "ready" | "completed"; draft?: { to: string; subject: string; body: string }; draftUuid?: string };
 
 async function getSessionId(params: Promise<{ sessionId: string }>): Promise<string> {
   const sessionId = (await params).sessionId;
@@ -72,6 +72,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
     const context = contextResult.rows.reverse().map((row) => JSON.stringify(row.log)).join("\n").slice(0, 30000);
     const requestText = typeof input.content === "string" ? input.content : JSON.stringify(input.content);
     const savedState = await getConversationState<ConversationState>(userId, sessionId);
+    const confirmationRequested = savedState?.status === "ready" && Boolean(savedState.draft) && (input.confirm === true || /\b(send it|send this|send the draft|go ahead and send|good[, ]+send it)\b/i.test(requestText));
+    if (confirmationRequested && savedState?.draft) {
+      try {
+        await sendEmail(userId, savedState.draft, crypto.randomUUID());
+        const sentLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "email_sent", draftUuid: savedState.draftUuid, message: `Email sent successfully to ${savedState.draft.to}.` } } };
+        await insertConversationLog(userId, sentLog);
+        await clearConversationState(userId, sessionId);
+        return NextResponse.json({ events: [userLog, sentLog], sent: true }, { status: 201 });
+      } catch (error) {
+        const message = error instanceof GmailConnectionError ? error.message : "We couldn't send this email.";
+        const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: message } } };
+        await insertConversationLog(userId, errorLog);
+        return NextResponse.json({ events: [userLog, errorLog], error: message }, { status: 502 });
+      }
+    }
     const agentKey = process.env.AGENT_SERVICE_KEY;
     if (!agentKey) return NextResponse.json({ error: "The agent service is not configured.", events: [userLog] }, { status: 503 });
     const agentResponse = await fetch(`${(process.env.AGENT_API_URL ?? "http://localhost:8000").replace(/\/$/, "")}/agent/draft`, {
@@ -88,10 +103,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
       return NextResponse.json({ error: message, events: [userLog, errorLog] }, { status: 502 });
     }
     const assistantContent: string | Record<string, unknown> = agentData.draft ? agentData.draft as Record<string, unknown> : agentData.clarification ?? "The agent did not return a response.";
-    const sendContext = `${context}\n${requestText}`;
-    const wantsToSend = savedState?.intent === "send_email" || (/\b(send|send out|send another)\b/i.test(sendContext) && !/\b(draft only|just draft|do not send|don't send)\b/i.test(sendContext));
+    const wantsToSend = savedState?.intent === "send_email" || (/\b(send|send out|send another)\b/i.test(requestText) && !/\b(draft only|just draft|do not send|don't send)\b/i.test(requestText));
     if (wantsToSend && !agentData.draft) await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "collecting" });
-    if (wantsToSend && agentData.draft && typeof agentData.draft === "object") {
+    if (agentData.draft && typeof agentData.draft === "object") {
       const draft = agentData.draft as { to?: unknown; subject?: unknown; body?: unknown };
       if (typeof draft.to !== "string" || typeof draft.subject !== "string" || typeof draft.body !== "string") {
         const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: "The agent returned an incomplete email draft, so it was not sent." } } };
@@ -102,23 +116,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
       const to = draft.to as string;
       const subject = draft.subject as string;
       const body = draft.body as string;
-      try {
-        await sendEmail(userId, { to, subject, body }, crypto.randomUUID());
-        const sentLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: `Email sent successfully to ${to}.` } };
-        await insertConversationLog(userId, sentLog);
-        await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "completed", draft: { to, subject, body } });
-        return NextResponse.json({ events: [userLog, sentLog] }, { status: 201 });
-      } catch (error) {
-        const message = error instanceof GmailConnectionError ? error.message : "We couldn't send this email.";
-        const errorLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "conversation_error", error: message } } };
-        await insertConversationLog(userId, errorLog);
-        await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "ready", draft: { to, subject, body } });
-        return NextResponse.json({ events: [userLog, errorLog], error: message }, { status: 502 });
-      }
+      const draftUuid = crypto.randomUUID();
+      const draftLog = { type: "assistant" as const, sessionId, uuid: draftUuid, parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "email_draft", draft: { to, subject, body }, requiresConfirmation: true } } };
+      await insertConversationLog(userId, draftLog);
+      await setConversationState<ConversationState>(userId, sessionId, { intent: "send_email", status: "ready", draft: { to, subject, body }, draftUuid });
+      return NextResponse.json({ events: [userLog, draftLog], requiresConfirmation: true }, { status: 201 });
     }
     const assistantLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: assistantContent } };
     await insertConversationLog(userId, assistantLog);
-    if (wantsToSend && agentData.draft) await clearConversationState(userId, sessionId);
     return NextResponse.json({ events: [userLog, assistantLog] }, { status: 201 });
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });
