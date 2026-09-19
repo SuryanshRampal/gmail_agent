@@ -39,6 +39,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .message-reader .email-body { font-size:16px; max-width:none; padding:36px 0 48px; width:100%; }.message-reader .summary-card { border:1px solid rgb(101 116 245 / .25); }
 @media (max-width:700px) { .reader-meta time { display:none; }.message-reader { padding:24px 18px; }.message-reader .email-body { font-size:15px; } }
 .email-frame { display:block; min-height:650px; width:100%; border:0; background:#fff; border-radius:10px; }
+[data-slot="sheet-content"] .message-reader { min-height:100%; border:0; border-radius:0; box-shadow:none; padding:clamp(8px,1.5vw,20px); }
+[data-slot="sheet-content"] .message-reader .email-body { padding-bottom:28px; }
 .plain-email { white-space:pre-wrap; overflow-wrap:anywhere; }
 .summary-content { min-width:0; }
 .search-highlight { border-radius:3px; background:#f4d35e; color:#171721; padding:0 2px; }

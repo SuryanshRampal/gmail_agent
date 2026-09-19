@@ -4,12 +4,14 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { insertConversationLog } from "@/lib/conversation-logs";
 import { requireUserId } from "@/lib/session";
-import { clearConversationState, getCached, getConversationState, setCached, setConversationState } from "@/lib/redis-cache";
+import { clearConversationState, getCached, getConversationState, invalidateConversationCache, setCached, setConversationState } from "@/lib/redis-cache";
 import { GmailConnectionError, sendEmail } from "@/lib/gmail";
 
 const contentSchema = z.union([z.string().trim().min(1).max(100000), z.record(z.string(), z.unknown())]);
 const continueSchema = z.object({ content: contentSchema, confirm: z.boolean().optional() });
 type ConversationState = { intent: "send_email" | "draft_email"; status: "collecting" | "ready" | "completed"; draft?: { to: string; subject: string; body: string }; draftUuid?: string };
+type DraftRecord = { draft: { to: string; subject: string; body: string }; draftUuid?: string };
+const extractDraft = (log: unknown, draftUuid?: string): DraftRecord | null => { if (!log || typeof log !== "object") return null; const message = (log as Record<string, unknown>).message; if (!message || typeof message !== "object") return null; let content = (message as Record<string, unknown>).content; if (typeof content === "string") { try { content = JSON.parse(content) as unknown; } catch { return null; } } if (!content || typeof content !== "object") return null; const record = content as Record<string, unknown>; const candidate = record.event === "email_draft" && record.draft && typeof record.draft === "object" ? record.draft as Record<string, unknown> : record; if (typeof candidate.to !== "string" || typeof candidate.subject !== "string" || typeof candidate.body !== "string") return null; return { draft: { to: candidate.to, subject: candidate.subject, body: candidate.body }, draftUuid }; };
 
 async function getSessionId(params: Promise<{ sessionId: string }>): Promise<string> {
   const sessionId = (await params).sessionId;
@@ -62,23 +64,26 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
     const userLog = { type: "user" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: latest.rows[0].uuid, message: { role: "user" as const, content: input.content } };
     await insertConversationLog(userId, userLog);
 
-    const contextResult = await db.query<{ log: unknown }>(`
-      select "Logs" as log
+    const contextResult = await db.query<{ uuid: string; log: unknown }>(`
+      select "UUID" as uuid, "Logs" as log
       from logs.conversation_events
       where "UserID" = $1 and "SessionID" = $2
       order by created_at desc, "UUID" desc
-      limit 15
+      limit 50
     `, [userId, sessionId]);
     const context = contextResult.rows.reverse().map((row) => JSON.stringify(row.log)).join("\n").slice(0, 30000);
     const requestText = typeof input.content === "string" ? input.content : JSON.stringify(input.content);
     const savedState = await getConversationState<ConversationState>(userId, sessionId);
-    const confirmationRequested = savedState?.status === "ready" && Boolean(savedState.draft) && (input.confirm === true || /\b(send it|send this|send the draft|go ahead and send|good[, ]+send it)\b/i.test(requestText));
-    if (confirmationRequested && savedState?.draft) {
+    const inferredDraft = contextResult.rows.map((row) => extractDraft(row.log, row.uuid)).find((record): record is DraftRecord => Boolean(record));
+    const draftRecord = savedState?.draft ? { draft: savedState.draft, draftUuid: savedState.draftUuid } : inferredDraft;
+    const confirmationRequested = Boolean(draftRecord) && (input.confirm === true || /\b(send it|send this|send the draft|go ahead and send|good[, ]+send it)\b/i.test(requestText));
+    if (confirmationRequested && draftRecord) {
       try {
-        await sendEmail(userId, savedState.draft, crypto.randomUUID());
-        const sentLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "email_sent", draftUuid: savedState.draftUuid, message: `Email sent successfully to ${savedState.draft.to}.` } } };
+        await sendEmail(userId, draftRecord.draft, crypto.randomUUID());
+        const sentLog = { type: "assistant" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: userLog.uuid, message: { role: "assistant" as const, content: { event: "email_sent", draftUuid: draftRecord.draftUuid, message: `Email sent successfully to ${draftRecord.draft.to}.` } } };
         await insertConversationLog(userId, sentLog);
         await clearConversationState(userId, sessionId);
+        await invalidateConversationCache(userId, sessionId);
         return NextResponse.json({ events: [userLog, sentLog], sent: true }, { status: 201 });
       } catch (error) {
         const message = error instanceof GmailConnectionError ? error.message : "We couldn't send this email.";

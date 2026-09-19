@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { GmailConnectionError, getEmails, type EmailRange } from "@/lib/gmail";
+import { GmailConnectionError, getEmails, type EmailRange, type MailboxFolder } from "@/lib/gmail";
 import { requireUserId } from "@/lib/session";
 
 export async function GET(request: Request) {
@@ -13,11 +13,13 @@ export async function GET(request: Request) {
     const pageToken = params.get("pageToken") || undefined;
     const search = params.get("search")?.trim() || undefined;
     const allTime = params.get("allTime") === "true";
+    const folder = params.get("folder") || "inbox";
     if (mode && !["recent", "date", "period"].includes(mode)) return NextResponse.json({ error: "Invalid email range." }, { status: 400 });
+    if (!["inbox", "sent", "drafts", "trash", "spam", "starred", "archive"].includes(folder)) return NextResponse.json({ error: "Invalid mailbox folder." }, { status: 400 });
     if (!search && mode !== "recent" && (!from || !to)) return NextResponse.json({ error: "A complete date range is required." }, { status: 400 });
     if (from && to && (!/^\d+$/.test(from) || !/^\d+$/.test(to) || Number(from) >= Number(to))) return NextResponse.json({ error: "Invalid date range." }, { status: 400 });
     if (timeZone) { try { new Intl.DateTimeFormat("en-US", { timeZone }).format(); } catch { return NextResponse.json({ error: "Invalid time zone." }, { status: 400 }); } }
-    return NextResponse.json(await getEmails(await requireUserId(), { mode, from, to, pageToken, search, allTime }));
+    return NextResponse.json(await getEmails(await requireUserId(), { mode, from, to, pageToken, search, allTime, folder: folder as MailboxFolder }));
   }
   catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });

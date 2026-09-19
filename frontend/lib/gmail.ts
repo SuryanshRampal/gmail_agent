@@ -105,7 +105,8 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), replyTo: header(message.payload?.headers, "Reply-To"), returnPath: header(message.payload?.headers, "Return-Path"), authenticationResults: header(message.payload?.headers, "Authentication-Results"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
-export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string; allTime?: boolean };
+export type MailboxFolder = "inbox" | "sent" | "drafts" | "trash" | "spam" | "starred" | "archive";
+export type EmailRange = { mode?: "recent" | "date" | "period"; from?: string; to?: string; pageToken?: string; search?: string; allTime?: boolean; folder?: MailboxFolder };
 export type GmailEmailPage = { messages: GmailMessage[]; nextPageToken?: string; resultSizeEstimate?: number };
 
 function gmailPhrase(value: string) { return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`; }
@@ -125,10 +126,20 @@ export function expandGmailSearch(value: string): string {
 
 export async function getEmails(userId: string, range: EmailRange = {}, context?: GmailRequestContext): Promise<GmailEmailPage> {
   const search = range.search?.trim();
-  const query = search ? expandGmailSearch(search) : range.from && range.to ? `after:${range.from} before:${range.to}` : range.allTime ? "" : "newer_than:30d";
+  const folder = range.folder ?? "inbox";
+  const folderQuery: Record<MailboxFolder, string> = {
+    inbox: "in:inbox",
+    sent: "in:sent",
+    drafts: "in:drafts",
+    trash: "in:trash",
+    spam: "in:spam",
+    starred: "is:starred",
+    archive: "-in:inbox -in:sent -in:drafts -in:trash -in:spam",
+  };
+  const dateQuery = range.from && range.to ? `after:${range.from} before:${range.to}` : range.allTime ? "" : "newer_than:30d";
+  const query = [folderQuery[folder], search ? expandGmailSearch(search) : "", dateQuery].filter(Boolean).join(" ");
   const ids: Array<{ id: string }> = [];
-  const params = new URLSearchParams({ maxResults: "25", q: search ? `in:anywhere ${query}` : query });
-  if (!search) params.set("labelIds", "INBOX");
+  const params = new URLSearchParams({ maxResults: "25", q: query });
   if (range.pageToken) params.set("pageToken", range.pageToken);
   const list = await (await gmailFetch(userId, `/messages?${params.toString()}`, undefined, context)).json() as { messages?: Array<{ id: string }>; nextPageToken?: string; resultSizeEstimate?: number };
   ids.push(...(list.messages ?? []));

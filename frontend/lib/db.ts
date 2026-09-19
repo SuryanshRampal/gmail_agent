@@ -5,6 +5,6 @@ databaseUrl?.searchParams.delete("sslmode");
 
 export const db = new Pool({
   connectionString: databaseUrl?.toString(),
-  ssl: databaseUrl ? { rejectUnauthorized: process.env.NODE_ENV === "production" } : undefined,
+  ssl: databaseUrl ? { rejectUnauthorized: false } : undefined,
   max: 5,
 });

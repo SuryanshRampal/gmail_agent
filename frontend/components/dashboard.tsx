@@ -4,11 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { signIn } from "next-auth/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { CalendarDays, ChevronDown, LoaderCircle, Mail, Send, Sparkles } from "lucide-react";
+import { CalendarDays, ChevronDown, LoaderCircle, Mail, Menu, Send, Sparkles } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
-import { NavUser } from "@/components/nav-user";
 import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Calendar, type DateRange } from "@/components/ui/calendar";
 import { resolveDateRange, toGmailBoundary, type RangeMode } from "@/lib/date-range";
@@ -21,6 +21,7 @@ type Message = { id: string; sender: string; recipients: string; subject: string
 type PhishingAssessment = { risk_level: "low_risk" | "needs_attention" | "high_risk" | "unable_to_verify"; confidence_band: "low" | "medium" | "high"; reasons: string[]; link_count: number; bounded: boolean };
 type AccessGuard = { decision: "allow" | "permission_required" | "blocked"; categories: string[]; warning: string; phishing?: PhishingAssessment; permissionToken?: string };
 type User = { name?: string | null; email?: string | null; image?: string | null };
+type Folder = "inbox" | "sent" | "drafts" | "trash" | "spam" | "starred" | "archive";
 const initial = (value?: string | null) => value?.slice(0, 1).toUpperCase() || "U";
 const formatDate = (value: string) => { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date); };
 const emailDocument = (html: string, blockedLinks: string[] = []) => html
@@ -63,6 +64,8 @@ export function Dashboard({ user }: { user: User }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [timePreset, setTimePreset] = useState<"all" | "15" | "30">("30");
+  const [folder, setFolder] = useState<Folder>("inbox");
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
   const [contentScan, setContentScan] = useState<ContentScan | null>(null);
   type MessagePage = { messages?: Message[]; nextPageToken?: string; resultSizeEstimate?: number; error?: string };
   type PrefetchedPage = { key: string; pageToken: string; data: MessagePage };
@@ -73,10 +76,10 @@ export function Dashboard({ user }: { user: User }) {
   const prefetchedPage = useRef<PrefetchedPage | null>(null);
   const prefetchingPage = useRef("");
 
-  const requestKey = (mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30") =>
-    JSON.stringify([mode, range.from?.getTime(), range.to?.getTime(), query.trim(), preset]);
+  const requestKey = (mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) =>
+    JSON.stringify([mode, range.from?.getTime(), range.to?.getTime(), query.trim(), preset, mailbox]);
 
-  const requestPage = async (mode: RangeMode, range: DateRange, continuation: string | undefined, query: string, preset: "all" | "15" | "30") => {
+  const requestPage = async (mode: RangeMode, range: DateRange, continuation: string | undefined, query: string, preset: "all" | "15" | "30", mailbox: Folder) => {
     const resolved = query.trim() || preset === "all" ? null : resolveDateRange(mode, range, new Date(), preset === "15" ? 15 : 30);
     if (!query.trim() && preset !== "all" && !resolved) return null;
     const params = new URLSearchParams({ mode, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
@@ -86,6 +89,7 @@ export function Dashboard({ user }: { user: User }) {
     }
     if (preset === "all" && !query.trim()) params.set("allTime", "true");
     if (query.trim()) params.set("search", query.trim());
+    params.set("folder", mailbox);
     if (continuation) params.set("pageToken", continuation);
     const response = await fetch(`/api/gmail/messages?${params.toString()}`);
     const data = await response.json() as MessagePage;
@@ -93,13 +97,13 @@ export function Dashboard({ user }: { user: User }) {
     return data;
   };
 
-  const prefetchPage = async (key: string, pageToken: string | undefined, mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30") => {
+  const prefetchPage = async (key: string, pageToken: string | undefined, mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) => {
     if (!pageToken || prefetchingPage.current === `${key}:${pageToken}`) return;
     if (prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === pageToken) return;
     const prefetchKey = `${key}:${pageToken}`;
     prefetchingPage.current = prefetchKey;
     try {
-      const data = await requestPage(mode, range, pageToken, query, preset);
+      const data = await requestPage(mode, range, pageToken, query, preset, mailbox);
       if (data && activeRequestKey.current === key) prefetchedPage.current = { key, pageToken, data };
     } catch {
       // A look-ahead request is opportunistic; the explicit Load More action retries it if needed.
@@ -108,9 +112,9 @@ export function Dashboard({ user }: { user: User }) {
     }
   };
 
-  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset) => {
+  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset, mailbox: Folder = folder) => {
     const currentRequest = ++requestNumber.current;
-    const key = requestKey(mode, range, query, preset);
+    const key = requestKey(mode, range, query, preset, mailbox);
     activeRequestKey.current = key;
     if (!append) prefetchedPage.current = null;
     if (append) setLoadingMore(true);
@@ -119,13 +123,14 @@ export function Dashboard({ user }: { user: User }) {
     if (!append) setError("");
     try {
       const cached = append && continuation && prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === continuation ? prefetchedPage.current.data : null;
-      const data = cached ?? await requestPage(mode, range, continuation, query, preset);
+      const data = cached ?? await requestPage(mode, range, continuation, query, preset, mailbox);
       if (!data) return;
       if (cached) prefetchedPage.current = null;
       if (currentRequest !== requestNumber.current) return;
       setMessages((existing) => append ? [...existing, ...(data.messages ?? [])] : (data.messages ?? []));
+      if (!append && mailbox === "inbox") setInboxUnreadCount((data.messages ?? []).filter((message) => message.isUnread).length);
       setNextPageToken(data.nextPageToken);
-      if (data.nextPageToken) void prefetchPage(key, data.nextPageToken, mode, range, query, preset);
+      if (data.nextPageToken) void prefetchPage(key, data.nextPageToken, mode, range, query, preset, mailbox);
       if (!append) { setSelected(null); setSummary(""); }
     } catch (caught) {
       if (currentRequest !== requestNumber.current) return;
@@ -150,7 +155,26 @@ export function Dashboard({ user }: { user: User }) {
   const send = async (form: HTMLFormElement) => { const values = new FormData(form); setSending(true); setNotice(""); try { const response = await fetch("/api/gmail/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: values.get("to"), subject: values.get("subject"), body: values.get("body") }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error); form.reset(); setNotice("Email sent successfully."); } catch (caught) { setNotice(caught instanceof Error ? caught.message : "We couldn't send the email. Please try again."); } finally { setSending(false); } };
 
   const visibleMessages = messages;
-	return <SidebarProvider defaultOpen style={{ "--sidebar-width": "clamp(28rem, 30vw, 32rem)" } as React.CSSProperties}><AppSidebar user={user} view={view} messages={visibleMessages} selectedId={selected?.id} unreadCount={visibleMessages.filter((message) => message.isUnread).length} hasMore={Boolean(nextPageToken)} loadingMore={loadingMore} searching={loading} pageError={pageError} onSearch={(query) => { setSearchQuery(query); void loadMessages(rangeMode, dateRange, false, undefined, query); }} onLoadMore={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} onRetryPage={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") setSelected(null); }} onSelectMessage={(message) => void openEmail(message)} onRefresh={() => void loadMessages()} /><SidebarInset className="min-w-0 bg-[#171721]"><header className="sticky top-0 z-10 flex min-h-16 shrink-0 items-center gap-3 border-b border-white/10 bg-[#171721]/90 px-5 py-3 backdrop-blur-xl md:px-8"><SidebarTrigger className="text-white/60 hover:bg-white/8 hover:text-white" /><Separator orientation="vertical" className="h-5 bg-white/15" /><div className="min-w-0 flex-1"><p className="text-xs font-medium uppercase tracking-[.18em] text-white/35">{view === "compose" ? "New message" : "Inbox"}</p>{view === "compose" ? <p className="text-sm text-white/75">Write to someone</p> : <RangeControls searchQuery={searchQuery} timePreset={timePreset} onPresetChange={(preset) => { setTimePreset(preset); setRangeMode("recent"); setRangeOpen(false); void loadMessages("recent", dateRange, false, undefined, searchQuery, preset); }} rangeMode={rangeMode} dateRange={dateRange} rangeOpen={rangeOpen} setRangeOpen={setRangeOpen} setDateRange={setDateRange} onCustomRange={(range) => { setRangeMode("period"); setTimePreset("30"); setRangeOpen(false); void loadMessages("period", range); }} />}</div><NavUser placement="header" user={{ name: user.name ?? "User", email: user.email ?? "", avatar: user.image ?? "" }} /></header><main className="mx-auto w-full max-w-[90rem] flex-1 p-4 md:p-6 lg:p-8">{view === "compose" ? <ComposeForm sending={sending} notice={notice} onCancel={() => setView("inbox")} onSend={send} /> : error ? <div className="error-card"><p>{error}</p>{error.includes("connection") && <button className="button button-primary" onClick={() => signIn("google", { callbackUrl: "/dashboard" })}>Reconnect Gmail</button>}</div> : loading ? <SkeletonRows /> : selected ? <Reader message={selected} accessGuard={accessGuard} contentScan={contentScan} onGrantAccess={() => void grantMessagePermission()} onRetryAssessment={() => void openEmail(selected)} onKeepClosed={() => { setSelected(null); setAccessGuard(null); setContentScan(null); }} summary={summary} summarizing={summarizing} onSummarize={() => void generateSummary()} /> : <div className="empty-state"><Mail size={26}/><h2>{visibleMessages.length ? "Select a message" : "No messages in this range"}</h2><p>{visibleMessages.length ? "Choose an email from your inbox to read it here." : "Try another date range to see more of your inbox."}</p></div>}</main></SidebarInset></SidebarProvider>;
+  const closeReader = () => { setSelected(null); setAccessGuard(null); setContentScan(null); setSummary(""); };
+  const folderLabel: Record<Folder, string> = { inbox: "Inbox", sent: "Sent", drafts: "Drafts", trash: "Trash", spam: "Spam", starred: "Starred", archive: "Archive" };
+
+  return <SidebarProvider defaultOpen style={{ "--sidebar-width": "17rem" } as React.CSSProperties}>
+    <AppSidebar user={user} view={view} folder={folder} unreadCount={inboxUnreadCount} onFolderChange={(next) => { setFolder(next); setSearchQuery(""); void loadMessages(rangeMode, dateRange, false, undefined, "", timePreset, next); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") closeReader(); }} onRefresh={() => void loadMessages()} />
+    <SidebarInset className="min-w-0 bg-[#171721]">
+      <header className="sticky top-0 z-10 flex min-h-16 shrink-0 items-center gap-8 border-b border-white/10 bg-[#171721]/90 px-5 py-3 backdrop-blur-xl md:px-8">
+        <SidebarTrigger aria-label="Main menu" title="Main menu" className="size-10 rounded-xl bg-[#6574f5] text-white shadow-[0_0_24px_rgba(101,116,245,.3)] hover:bg-[#7180ff] hover:text-white"><Menu className="size-5" /></SidebarTrigger><Separator orientation="vertical" className="h-18 self-center !w-1 rounded-full bg-[#6574f5]/90" />
+        <div className="min-w-0 flex-1">{view === "compose" ? <><p className="text-xs font-medium uppercase tracking-[.18em] text-white/35">New message</p><p className="text-sm text-white/75">Write to someone</p></> : <RangeControls searchQuery={searchQuery} timePreset={timePreset} onPresetChange={(preset) => { setTimePreset(preset); setRangeMode("recent"); setRangeOpen(false); void loadMessages("recent", dateRange, false, undefined, searchQuery, preset); }} rangeMode={rangeMode} dateRange={dateRange} rangeOpen={rangeOpen} setRangeOpen={setRangeOpen} setDateRange={setDateRange} onCustomRange={(range) => { setRangeMode("period"); setTimePreset("30"); setRangeOpen(false); void loadMessages("period", range); }} />}</div>
+      </header>
+      <main className="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6 lg:p-8">
+        {view === "compose" ? <ComposeForm sending={sending} notice={notice} onCancel={() => setView("inbox")} onSend={send} /> : error ? <div className="error-card"><p>{error}</p>{error.includes("connection") && <button className="button button-primary" onClick={() => signIn("google", { callbackUrl: "/dashboard" })}>Reconnect Gmail</button>}</div> : loading ? <SkeletonRows /> : <MessageList folderLabel={folderLabel[folder]} messages={visibleMessages} query={searchQuery} searching={loading} hasMore={Boolean(nextPageToken)} loadingMore={loadingMore} pageError={pageError} onSearch={(query) => { setSearchQuery(query); void loadMessages(rangeMode, dateRange, false, undefined, query); }} onSelectMessage={(message) => void openEmail(message)} onLoadMore={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} onRetryPage={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} />}
+      </main>
+    </SidebarInset>
+    {selected && <Sheet open onOpenChange={(open) => { if (!open) closeReader(); }}><SheetContent side="right" className="w-full gap-0 overflow-hidden border-white/10 bg-[#1e1e2a] p-0 text-white sm:!max-w-none md:w-[62vw] md:max-w-[980px]"><SheetTitle className="sr-only">{selected.subject}</SheetTitle><div className="flex-1 overflow-y-auto p-4 md:p-6"><Reader message={selected} accessGuard={accessGuard} contentScan={contentScan} onGrantAccess={() => void grantMessagePermission()} onRetryAssessment={() => void openEmail(selected)} onKeepClosed={closeReader} summary={summary} summarizing={summarizing} onSummarize={() => void generateSummary()} /></div></SheetContent></Sheet>}
+  </SidebarProvider>;
+}
+
+function MessageList({ folderLabel, messages, query, searching, hasMore, loadingMore, pageError, onSearch, onSelectMessage, onLoadMore, onRetryPage }: { folderLabel: string; messages: Message[]; query: string; searching: boolean; hasMore: boolean; loadingMore: boolean; pageError: string; onSearch: (query: string) => void; onSelectMessage: (message: Message) => void; onLoadMore: () => void; onRetryPage: () => void }) {
+  return <section className="overflow-hidden rounded-2xl border border-white/10 bg-[#1e1e2a] shadow-2xl shadow-black/10"><div className="border-b border-white/10 p-5 md:p-6"><div className="flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">{folderLabel.toUpperCase()}</p><h1 className="mt-1 text-2xl font-medium tracking-tight text-white md:text-3xl">{folderLabel}</h1><p className="mt-1 text-sm text-white/45">{messages.length} messages in this view</p></div><label className="relative w-full max-w-sm"><span className="sr-only">Search messages</span><input value={query} onChange={(event) => onSearch(event.target.value)} placeholder={`Search ${folderLabel.toLowerCase()}…`} className="h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white outline-none transition-colors placeholder:text-white/35 focus:border-[#6574f5]/70" /></label></div></div><div>{messages.length === 0 ? <div className="empty-state border-0 bg-transparent"><Mail size={26}/><h2>{searching ? "Searching messages…" : `No messages in ${folderLabel.toLowerCase()}`}</h2><p>{query ? "Try a different search phrase." : "This folder is currently empty."}</p></div> : messages.map((message) => <button key={message.id} type="button" onClick={() => onSelectMessage(message)} className="group grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-white/8 px-5 py-4 text-left transition-colors hover:bg-white/6 md:px-6"><span className={`row-span-2 flex size-9 items-center justify-center rounded-full text-xs font-semibold ${message.isUnread ? "bg-[#6574f5] text-white" : "bg-white/10 text-white/60"}`}>{initial(message.sender)}</span><span className={`min-w-0 truncate text-sm ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}>{message.sender || "Unknown sender"}</span><time className="text-xs text-white/40">{formatDate(message.receivedAt)}</time><span className={`col-start-2 min-w-0 truncate text-sm ${message.isUnread ? "font-medium text-white/90" : "text-white/55"}`}>{message.subject}<span className="ml-2 text-white/35">— {message.snippet}</span></span></button>)}</div>{pageError && <div className="px-5 py-4 text-sm text-red-200/80"><p>This page could not be loaded.</p><button type="button" className="mt-2 text-[#aeb8ff] underline underline-offset-2" onClick={onRetryPage}>Retry</button></div>}{hasMore && <div className="p-4 text-center"><button type="button" className="button button-ghost" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? <><LoaderCircle className="spin" size={15} /> Loading…</> : "Load more messages"}</button></div>}</section>
 }
 
 function RangeControls({ searchQuery, timePreset, onPresetChange, rangeMode, dateRange, rangeOpen, setRangeOpen, setDateRange, onCustomRange }: { searchQuery: string; timePreset: "all" | "15" | "30"; onPresetChange: (preset: "all" | "15" | "30") => void; rangeMode: RangeMode; dateRange: DateRange; rangeOpen: boolean; setRangeOpen: (open: boolean) => void; setDateRange: (range: DateRange) => void; onCustomRange: (range: DateRange) => void }) {
