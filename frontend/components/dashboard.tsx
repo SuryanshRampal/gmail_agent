@@ -43,6 +43,24 @@ const summaryMarkdownComponents = {
   },
 };
 const shortDate = (date?: Date) => date ? new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date) : "";
+const MESSAGE_CACHE_TTL_MS = 120_000;
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!terms.length || !text) return <>{text}</>;
+  const normalizedTerms = terms.map((term) => term.replace(/[._-]+/g, "")).filter(Boolean);
+  const compactQuery = normalizedTerms.join("");
+  const phrasePattern = terms.length > 1 ? terms.map(escapeRegex).join("[\\s._-]+") : "";
+  const patterns = [...new Set([
+    ...terms.map(escapeRegex),
+    ...normalizedTerms.filter((term) => term.length > 1).map(escapeRegex),
+    compactQuery.length > 1 ? escapeRegex(compactQuery) : "",
+    phrasePattern,
+  ].filter(Boolean))].sort((left, right) => right.length - left.length);
+  const matcher = new RegExp(`(${patterns.join("|")})`, "gi");
+  return <>{text.split(matcher).map((part, index) => index % 2 === 1 ? <mark className="search-highlight" key={`${part}-${index}`}>{part}</mark> : part)}</>;
+}
 
 export function Dashboard({ user }: { user: User }) {
   const [view, setView] = useState<"inbox" | "compose">("inbox");
@@ -69,12 +87,14 @@ export function Dashboard({ user }: { user: User }) {
   const [contentScan, setContentScan] = useState<ContentScan | null>(null);
   type MessagePage = { messages?: Message[]; nextPageToken?: string; resultSizeEstimate?: number; error?: string };
   type PrefetchedPage = { key: string; pageToken: string; data: MessagePage };
+  type CachedPage = { data: MessagePage; cachedAt: number };
   const requestNumber = useRef(0);
   const conversationSessionId = useRef(crypto.randomUUID());
   const conversationPreviousUuid = useRef<string | null>(null);
   const activeRequestKey = useRef("");
   const prefetchedPage = useRef<PrefetchedPage | null>(null);
   const prefetchingPage = useRef("");
+  const messageCache = useRef(new Map<string, CachedPage>());
 
   const requestKey = (mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) =>
     JSON.stringify([mode, range.from?.getTime(), range.to?.getTime(), query.trim(), preset, mailbox]);
@@ -112,7 +132,7 @@ export function Dashboard({ user }: { user: User }) {
     }
   };
 
-  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset, mailbox: Folder = folder) => {
+  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset, mailbox: Folder = folder, forceRefresh = false) => {
     const currentRequest = ++requestNumber.current;
     const key = requestKey(mode, range, query, preset, mailbox);
     activeRequestKey.current = key;
@@ -122,10 +142,14 @@ export function Dashboard({ user }: { user: User }) {
     setPageError("");
     if (!append) setError("");
     try {
-      const cached = append && continuation && prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === continuation ? prefetchedPage.current.data : null;
-      const data = cached ?? await requestPage(mode, range, continuation, query, preset, mailbox);
+      const prefetched = append && continuation && prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === continuation ? prefetchedPage.current.data : null;
+      const cachedEntry = !append && !forceRefresh ? messageCache.current.get(key) : undefined;
+      const cached = cachedEntry && Date.now() - cachedEntry.cachedAt < MESSAGE_CACHE_TTL_MS ? cachedEntry.data : null;
+      if (cachedEntry && !cached) messageCache.current.delete(key);
+      const data = prefetched ?? cached ?? await requestPage(mode, range, continuation, query, preset, mailbox);
       if (!data) return;
-      if (cached) prefetchedPage.current = null;
+      if (prefetched) prefetchedPage.current = null;
+      if (!append && !cached && !prefetched) messageCache.current.set(key, { data, cachedAt: Date.now() });
       if (currentRequest !== requestNumber.current) return;
       setMessages((existing) => append ? [...existing, ...(data.messages ?? [])] : (data.messages ?? []));
       if (!append && mailbox === "inbox") setInboxUnreadCount((data.messages ?? []).filter((message) => message.isUnread).length);
@@ -164,7 +188,7 @@ export function Dashboard({ user }: { user: User }) {
   };
 
   return <SidebarProvider defaultOpen style={{ "--sidebar-width": "14rem" } as React.CSSProperties}>
-    <AppSidebar user={user} view={view} folder={folder} unreadCount={inboxUnreadCount} onFolderChange={(next) => { setFolder(next); setSearchQuery(""); void loadMessages(rangeMode, dateRange, false, undefined, "", timePreset, next); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") closeReader(); }} onRefresh={() => void loadMessages()} />
+    <AppSidebar user={user} view={view} folder={folder} unreadCount={inboxUnreadCount} onFolderChange={(next) => { setFolder(next); setSearchQuery(""); void loadMessages(rangeMode, dateRange, false, undefined, "", timePreset, next); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") closeReader(); }} onRefresh={() => void loadMessages(rangeMode, dateRange, false, undefined, searchQuery, timePreset, folder, true)} />
     <SidebarInset className="min-w-0 bg-[#171721]">
       <header className="sticky top-0 z-10 flex min-h-12 shrink-0 items-center gap-4 border-b border-white/10 bg-[#171721]/90 px-4 py-2 backdrop-blur-xl md:px-6">
         <SidebarTrigger aria-label="Main menu" title="Main menu" className="size-8 rounded-xl bg-[#6574f5] text-white shadow-[0_0_20px_rgba(101,116,245,.28)] hover:bg-[#7180ff] hover:text-white"><Menu className="size-4" /></SidebarTrigger><Separator orientation="vertical" className="my-auto h-8 !w-px rounded-full bg-[#6574f5]/90" />
@@ -179,7 +203,7 @@ export function Dashboard({ user }: { user: User }) {
 }
 
 function MessageList({ folderLabel, messages, query, searching, hasMore, loadingMore, pageError, onSearch, onSelectMessage, onLoadMore, onRetryPage }: { folderLabel: string; messages: Message[]; query: string; searching: boolean; hasMore: boolean; loadingMore: boolean; pageError: string; onSearch: (query: string) => void; onSelectMessage: (message: Message) => void; onLoadMore: () => void; onRetryPage: () => void }) {
-  return <section className="inbox-message-list overflow-hidden rounded border border-white/10 bg-[#1e1e2a] shadow-xl shadow-[#6574f5]/30"><div className="inbox-list-header border-b border-white/10 p-4 shadow-xl shadow-black/80 md:p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h1 className="text-xl font-semibold tracking-tight text-white md:text-2xl">{folderLabel}</h1><p className="mt-1 text-xs text-white/50">{messages.length} messages in this view</p></div><label className="relative w-full max-w-sm"><span className="sr-only">Search messages</span><input value={query} onChange={(event) => onSearch(event.target.value)} placeholder={`Search ${folderLabel.toLowerCase()}…`} className="h-6 w-80 rounded-full border border-white/30 bg-[#6574f5] px-3 text-sm text-black/50 shadow-xl shadow-white/10 outline-none transition-colors placeholder:text-sm placeholder:text-black/50 focus:border-[#6574f5]/60" /></label></div></div><div>{messages.length === 0 ? <div className="empty-state border-0 bg-transparent"><Mail size={26}/><h2>{searching ? "Searching messages…" : `No messages in ${folderLabel.toLowerCase()}`}</h2><p>{query ? "Try a different search phrase." : "This folder is currently empty."}</p></div> : messages.map((message) => <button key={message.id} type="button" onClick={() => onSelectMessage(message)} className="group grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-white/8 px-4 py-3.5 text-left shadow-xl shadow-black/80 transition-colors hover:bg-[#6574f5]/10 md:px-6"><span className={`row-span-2 flex size-8 items-center justify-center rounded-full bg-gradient-to-br from-[#8290ff] via-[#6574f5] to-[#4556d9] text-xs font-semibold text-white shadow-[0_4px_10px_rgba(101,116,245,.35)] ${message.isUnread ? "" : "bg-none bg-white/10 text-white/60 shadow-none"}`}>{initial(message.sender)}</span><span className={`min-w-0 truncate text-[13px] ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}>{message.sender || "Unknown sender"}</span><time className="text-[9px] text-white/55">{formatDate(message.receivedAt)}</time><span className={`col-start-2 min-w-0 truncate text-[13px] ${message.isUnread ? "font-medium text-white/90" : "text-white/55"}`}>{message.subject}<span className="ml-2 text-white/35">— {message.snippet}</span></span></button>)}</div>{pageError && <div className="px-5 py-4 text-sm text-red-200/80"><p>This page could not be loaded.</p><button type="button" className="mt-2 text-[#aeb8ff] underline underline-offset-2" onClick={onRetryPage}>Retry</button></div>}{hasMore && <div className="p-3 text-center"><button type="button" className="button button-ghost" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? <><LoaderCircle className="spin" size={15} /> Loading…</> : "Load more messages"}</button></div>}</section>
+  return <section className="inbox-message-list overflow-hidden rounded border border-white/10 bg-[#1e1e2a] shadow-xl shadow-[#6574f5]/30"><div className="inbox-list-header border-b border-white/10 p-4 shadow-xl shadow-black/80 md:p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h1 className="text-xl font-semibold tracking-tight text-white md:text-2xl">{folderLabel}</h1><p className="mt-1 text-xs text-white/50">{messages.length} messages in this view</p></div><label className="relative w-full max-w-sm"><span className="sr-only">Search messages</span><input value={query} onChange={(event) => onSearch(event.target.value)} placeholder={`Search ${folderLabel.toLowerCase()}…`} className="h-6 w-80 rounded-full border border-white/30 bg-[#6574f5] px-3 text-sm text-black/50 shadow-xl shadow-white/10 outline-none transition-colors placeholder:text-sm placeholder:text-black/50 focus:border-[#6574f5]/60" /></label></div></div><div>{messages.length === 0 ? <div className="empty-state border-0 bg-transparent"><Mail size={26}/><h2>{searching ? "Searching messages…" : `No messages in ${folderLabel.toLowerCase()}`}</h2><p>{query ? "Try a different search phrase." : "This folder is currently empty."}</p></div> : messages.map((message) => <button key={message.id} type="button" onClick={() => onSelectMessage(message)} className="group grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-white/8 px-4 py-3.5 text-left shadow-xl shadow-black/80 transition-colors hover:bg-[#6574f5]/10 md:px-6"><span className={`row-span-2 flex size-8 items-center justify-center rounded-full bg-gradient-to-br from-[#8290ff] via-[#6574f5] to-[#4556d9] text-xs font-semibold text-white shadow-[0_4px_10px_rgba(101,116,245,.35)] ${message.isUnread ? "" : "bg-none bg-white/10 text-white/60 shadow-none"}`}>{initial(message.sender)}</span><span className={`min-w-0 truncate text-[13px] ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}><HighlightedText text={message.sender || "Unknown sender"} query={query} /></span><time className="text-[9px] text-white/55">{formatDate(message.receivedAt)}</time><span className={`col-start-2 min-w-0 truncate text-[13px] ${message.isUnread ? "font-medium text-white/90" : "text-white/55"}`}><HighlightedText text={message.subject} query={query} /><span className="ml-2 text-white/35">— <HighlightedText text={message.snippet} query={query} /></span></span></button>)}</div>{pageError && <div className="px-5 py-4 text-sm text-red-200/80"><p>This page could not be loaded.</p><button type="button" className="mt-2 text-[#aeb8ff] underline underline-offset-2" onClick={onRetryPage}>Retry</button></div>}{hasMore && <div className="p-3 text-center"><button type="button" className="button button-ghost" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? <><LoaderCircle className="spin" size={15} /> Loading…</> : "Load more messages"}</button></div>}</section>
 }
 
 function RangeControls({ searchQuery, timePreset, onPresetChange, rangeMode, dateRange, rangeOpen, setRangeOpen, setDateRange, onCustomRange }: { searchQuery: string; timePreset: "all" | "15" | "30"; onPresetChange: (preset: "all" | "15" | "30") => void; rangeMode: RangeMode; dateRange: DateRange; rangeOpen: boolean; setRangeOpen: (open: boolean) => void; setDateRange: (range: DateRange) => void; onCustomRange: (range: DateRange) => void }) {
