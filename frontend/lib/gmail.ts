@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { decryptToken, encryptToken } from "@/lib/encryption";
 import { googleOAuthCredentials } from "@/lib/auth";
+import { oauthEnvironment } from "@/lib/oauth-environment";
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -26,7 +27,7 @@ function logError(context: GmailRequestContext | undefined, message: string, err
 async function getAccessToken(userId: string, context?: GmailRequestContext): Promise<string> {
   const startedAt = Date.now();
   log(context, "loading stored Google account", { userId });
-  const { rows } = await db.query<StoredAccount>("select access_token, refresh_token, expires_at from next_auth.accounts where \"userId\" = $1 and provider = 'google' order by id desc limit 1", [userId]);
+  const { rows } = await db.query<StoredAccount>("select access_token, refresh_token, expires_at from next_auth.accounts where \"userId\" = $1 and provider = 'google' and oauth_environment = $2 order by id desc limit 1", [userId, oauthEnvironment]);
   const account = rows[0];
   log(context, "stored Google account loaded", { hasAccount: Boolean(account), hasAccessToken: Boolean(account?.access_token), hasRefreshToken: Boolean(account?.refresh_token), expiresAt: account?.expires_at ?? null, durationMs: Date.now() - startedAt });
   if (!account?.access_token) throw new GmailConnectionError("Gmail is not connected.");
@@ -45,12 +46,14 @@ async function getAccessToken(userId: string, context?: GmailRequestContext): Pr
   log(context, "refreshing expired Google access token");
   const response = await fetch(GOOGLE_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: googleOAuthCredentials.clientId, client_secret: googleOAuthCredentials.clientSecret, grant_type: "refresh_token", refresh_token: decryptToken(account.refresh_token) }), cache: "no-store" });
   if (!response.ok) {
-    log(context, "Google token refresh failed", { status: response.status, statusText: response.statusText });
+    let errorPayload: { error?: string; error_description?: string; error_subtype?: string } = {};
+    try { errorPayload = await response.json() as typeof errorPayload; } catch { /* Keep the HTTP status when Google returns no JSON. */ }
+    log(context, "Google token refresh failed", { status: response.status, statusText: response.statusText, googleError: errorPayload.error, googleErrorDescription: errorPayload.error_description, googleErrorSubtype: errorPayload.error_subtype });
     throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
   }
-  const token = await response.json() as { access_token: string; expires_in: number };
+  const token = await response.json() as { access_token: string; expires_in: number; refresh_token?: string };
   log(context, "Google access token refreshed", { expiresIn: token.expires_in });
-  await db.query("update next_auth.accounts set access_token = $1, expires_at = $2 where \"userId\" = $3 and provider = 'google'", [encryptToken(token.access_token), Math.floor(Date.now() / 1000) + token.expires_in, userId]);
+  await db.query("update next_auth.accounts set access_token = $1, refresh_token = coalesce($2, refresh_token), expires_at = $3 where \"userId\" = $4 and provider = 'google' and oauth_environment = $5", [encryptToken(token.access_token), token.refresh_token ? encryptToken(token.refresh_token) : null, Math.floor(Date.now() / 1000) + token.expires_in, userId, oauthEnvironment]);
   return token.access_token;
 }
 
