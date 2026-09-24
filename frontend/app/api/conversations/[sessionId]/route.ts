@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
-import { insertConversationLog } from "@/lib/conversation-logs";
+import { decodeConversationLog, insertConversationLog } from "@/lib/conversation-logs";
 import { requireUserId } from "@/lib/session";
 import { clearConversationState, getCached, getConversationState, invalidateConversationCache, setCached, setConversationState } from "@/lib/redis-cache";
 import { GmailConnectionError, sendEmail } from "@/lib/gmail";
@@ -30,7 +30,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
     const cached = await getCached<{ sessionId: string; events: unknown[]; hasMore: boolean; nextPage: number | null }>(cacheKey);
     if (cached) return NextResponse.json(cached);
     const result = await db.query(`
-      select "UUID" as "uuid", "SessionID" as "sessionId", "Logs" as "log", created_at as "createdAt"
+      select "UUID" as "uuid", "SessionID" as "sessionId", "Logs" as "legacyLog", "EncryptedLogs" as "encryptedLog", created_at as "createdAt"
       from logs.conversation_events
       where "UserID" = $1 and "SessionID" = $2
       order by created_at desc, "UUID" desc
@@ -38,7 +38,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
     `, [userId, sessionId, limit + 1, page * limit]);
     if (result.rowCount === 0) return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
     const hasMore = result.rows.length > limit;
-    const payload = { sessionId, events: result.rows.slice(0, limit).reverse(), hasMore, nextPage: hasMore ? page + 1 : null };
+    const events = result.rows.slice(0, limit).map((row) => ({ uuid: row.uuid, sessionId: row.sessionId, log: decodeConversationLog(row.encryptedLog, row.legacyLog), createdAt: row.createdAt })).reverse();
+    const payload = { sessionId, events, hasMore, nextPage: hasMore ? page + 1 : null };
     await setCached(cacheKey, payload, 60);
     return NextResponse.json(payload);
   } catch (error) {
@@ -64,17 +65,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ ses
     const userLog = { type: "user" as const, sessionId, uuid: crypto.randomUUID(), parentUuid: latest.rows[0].uuid, message: { role: "user" as const, content: input.content } };
     await insertConversationLog(userId, userLog);
 
-    const contextResult = await db.query<{ uuid: string; log: unknown }>(`
-      select "UUID" as uuid, "Logs" as log
+    const contextResult = await db.query<{ uuid: string; legacyLog: unknown; encryptedLog: string | null }>(`
+      select "UUID" as uuid, "Logs" as "legacyLog", "EncryptedLogs" as "encryptedLog"
       from logs.conversation_events
       where "UserID" = $1 and "SessionID" = $2
       order by created_at desc, "UUID" desc
       limit 50
     `, [userId, sessionId]);
-    const context = contextResult.rows.reverse().map((row) => JSON.stringify(row.log)).join("\n").slice(0, 30000);
+    const decodedContext = contextResult.rows.map((row) => ({ uuid: row.uuid, log: decodeConversationLog(row.encryptedLog, row.legacyLog) }));
+    const context = [...decodedContext].reverse().map((row) => JSON.stringify(row.log)).join("\n").slice(0, 30000);
     const requestText = typeof input.content === "string" ? input.content : JSON.stringify(input.content);
     const savedState = await getConversationState<ConversationState>(userId, sessionId);
-    const inferredDraft = contextResult.rows.map((row) => extractDraft(row.log, row.uuid)).find((record): record is DraftRecord => Boolean(record));
+    const inferredDraft = decodedContext.map((row) => extractDraft(row.log, row.uuid)).find((record): record is DraftRecord => Boolean(record));
     const draftRecord = savedState?.draft ? { draft: savedState.draft, draftUuid: savedState.draftUuid } : inferredDraft;
     const confirmationRequested = Boolean(draftRecord) && (input.confirm === true || /\b(send it|send this|send the draft|go ahead and send|good[, ]+send it)\b/i.test(requestText));
     if (confirmationRequested && draftRecord) {

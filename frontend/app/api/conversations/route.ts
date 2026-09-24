@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
-import { insertConversationLog } from "@/lib/conversation-logs";
+import { decodeConversationLog, insertConversationLog } from "@/lib/conversation-logs";
 import { requireUserId } from "@/lib/session";
 import { getCached, setCached } from "@/lib/redis-cache";
 
@@ -16,15 +16,26 @@ export async function GET() {
     const cached = await getCached<{ conversations: unknown[] }>(cacheKey);
     if (cached) return NextResponse.json(cached);
     const result = await db.query(`
-      select "SessionID" as "sessionId", count(*)::int as "eventCount",
-             coalesce(nullif(left(regexp_replace((array_agg("Logs"->'message'->>'content' order by created_at asc) filter (where "Logs"->>'type' = 'user'))[1], '^Requested access assessment for email [^:]+: ', 'Opened email: '), 72), ''), 'Untitled conversation') as title,
-             min(created_at) as "createdAt", max(created_at) as "updatedAt"
+      select "SessionID" as "sessionId", "Logs" as "legacyLog", "EncryptedLogs" as "encryptedLog", created_at as "createdAt"
       from logs.conversation_events
       where "UserID" = $1
-      group by "SessionID"
-      order by max(created_at) desc
+      order by created_at asc, "UUID" asc
     `, [userId]);
-    const payload = { conversations: result.rows };
+    const summaries = new Map<string, { sessionId: string; eventCount: number; title: string; createdAt: unknown; updatedAt: unknown }>();
+    for (const row of result.rows) {
+      const existing = summaries.get(row.sessionId);
+      const log = decodeConversationLog(row.encryptedLog, row.legacyLog);
+      const content = log && typeof log === "object" && "type" in log && log.type === "user" && "message" in log && log.message && typeof log.message === "object" && "content" in log.message && typeof log.message.content === "string" ? log.message.content : "";
+      const title = content.replace(/^Requested access assessment for email [^:]+: /, "Opened email: ").slice(0, 72).trim() || "Untitled conversation";
+      if (!existing) {
+        summaries.set(row.sessionId, { sessionId: row.sessionId, eventCount: 1, title, createdAt: row.createdAt, updatedAt: row.createdAt });
+      } else {
+        existing.eventCount += 1;
+        existing.updatedAt = row.createdAt;
+      }
+    }
+    const conversations = [...summaries.values()].sort((a, b) => new Date(String(b.updatedAt)).getTime() - new Date(String(a.updatedAt)).getTime());
+    const payload = { conversations };
     await setCached(cacheKey, payload, 45);
     return NextResponse.json(payload);
   } catch (error) {
