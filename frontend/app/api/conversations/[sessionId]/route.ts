@@ -40,7 +40,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
     const hasMore = result.rows.length > limit;
     const events = result.rows.slice(0, limit).map((row) => ({ uuid: row.uuid, sessionId: row.sessionId, log: decodeConversationLog(row.encryptedLog, row.legacyLog), createdAt: row.createdAt })).reverse();
     const payload = { sessionId, events, hasMore, nextPage: hasMore ? page + 1 : null };
-    await setCached(cacheKey, payload, 60);
+    await setCached(cacheKey, payload, 5 * 60);
     return NextResponse.json(payload);
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });

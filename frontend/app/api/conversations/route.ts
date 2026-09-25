@@ -36,7 +36,7 @@ export async function GET() {
     }
     const conversations = [...summaries.values()].sort((a, b) => new Date(String(b.updatedAt)).getTime() - new Date(String(a.updatedAt)).getTime());
     const payload = { conversations };
-    await setCached(cacheKey, payload, 45);
+    await setCached(cacheKey, payload, 5 * 60);
     return NextResponse.json(payload);
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED") return NextResponse.json({ error: "Please sign in to continue." }, { status: 401 });
