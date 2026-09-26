@@ -14,8 +14,8 @@ Google OAuth through NextAuth.js.
    `docs/next_auth_schema.sql` is present in the Supabase database. The app
    uses those tables directly and does not create a duplicate auth schema.
 2. Copy `frontend/.env.local.example` to `frontend/.env.local`. Set
-   `DATABASE_URL`, Google OAuth credentials, `NEXTAUTH_SECRET`, and a distinct
-   32-byte base64 `TOKEN_ENCRYPTION_KEY`.
+   `DATABASE_URL`, Google OAuth credentials, `NEXTAUTH_SECRET`, a distinct
+   32-byte base64 `TOKEN_ENCRYPTION_KEY`, and `OAUTH_ENVIRONMENT=local`.
 3. Configure the Google OAuth client with `http://localhost:3000` as an
    authorized JavaScript origin and
    `http://localhost:3000/api/auth/callback/google` as an authorized redirect
@@ -52,3 +52,12 @@ Access and refresh tokens are AES-256-GCM encrypted before they are persisted
 to `next_auth.accounts`; the browser never receives them. Future public-schema
 tables must have explicit Row Level Security policies and Data API exposure
 where needed.
+
+## OAuth environments
+
+Google refresh tokens belong to the OAuth client that issued them. If local,
+Preview, and Production use different Google OAuth clients while sharing one
+database, configure `OAUTH_ENVIRONMENT` in each deployment (`local`, `preview`,
+and `production` respectively). Apply the migration in
+`backend/supabase/migrations` before deploying this code. Each environment will
+then store and refresh its own encrypted Google account token.

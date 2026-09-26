@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { signIn } from "next-auth/react";
+import { signIn, signOut } from "next-auth/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { CalendarDays, ChevronDown, LoaderCircle, Mail, Menu, Send, Sparkles } from "lucide-react";
+import { CalendarClock, CalendarDays, ChevronDown, LoaderCircle, Mail, Menu, Send, Sparkles } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
@@ -43,6 +43,25 @@ const summaryMarkdownComponents = {
   },
 };
 const shortDate = (date?: Date) => date ? new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date) : "";
+const MESSAGE_CACHE_TTL_MS = 120_000;
+const MESSAGE_PAGE_SIZE = 25;
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!terms.length || !text) return <>{text}</>;
+  const normalizedTerms = terms.map((term) => term.replace(/[._-]+/g, "")).filter(Boolean);
+  const compactQuery = normalizedTerms.join("");
+  const phrasePattern = terms.length > 1 ? terms.map(escapeRegex).join("[\\s._-]+") : "";
+  const patterns = [...new Set([
+    ...terms.map(escapeRegex),
+    ...normalizedTerms.filter((term) => term.length > 1).map(escapeRegex),
+    compactQuery.length > 1 ? escapeRegex(compactQuery) : "",
+    phrasePattern,
+  ].filter(Boolean))].sort((left, right) => right.length - left.length);
+  const matcher = new RegExp(`(${patterns.join("|")})`, "gi");
+  return <>{text.split(matcher).map((part, index) => index % 2 === 1 ? <mark className="search-highlight" key={`${part}-${index}`}>{part}</mark> : part)}</>;
+}
 
 export function Dashboard({ user }: { user: User }) {
   const [view, setView] = useState<"inbox" | "compose">("inbox");
@@ -58,6 +77,9 @@ export function Dashboard({ user }: { user: User }) {
   const [dateRange, setDateRange] = useState<DateRange>({ from: new Date(), to: new Date() });
   const [rangeOpen, setRangeOpen] = useState(false);
   const [nextPageToken, setNextPageToken] = useState<string | undefined>();
+  const [pageNumber, setPageNumber] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [pageStartTokens, setPageStartTokens] = useState<Array<string | undefined>>([undefined]);
   const [pageError, setPageError] = useState("");
   const [accessGuard, setAccessGuard] = useState<AccessGuard | null>(null);
   const [messagePermission, setMessagePermission] = useState("");
@@ -68,16 +90,17 @@ export function Dashboard({ user }: { user: User }) {
   const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
   const [contentScan, setContentScan] = useState<ContentScan | null>(null);
   type MessagePage = { messages?: Message[]; nextPageToken?: string; resultSizeEstimate?: number; error?: string };
-  type PrefetchedPage = { key: string; pageToken: string; data: MessagePage };
+  type CachedPage = { data: MessagePage; cachedAt: number };
   const requestNumber = useRef(0);
   const conversationSessionId = useRef(crypto.randomUUID());
   const conversationPreviousUuid = useRef<string | null>(null);
   const activeRequestKey = useRef("");
-  const prefetchedPage = useRef<PrefetchedPage | null>(null);
-  const prefetchingPage = useRef("");
+  const prefetchingPages = useRef(new Set<string>());
+  const messageCache = useRef(new Map<string, CachedPage>());
 
   const requestKey = (mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) =>
     JSON.stringify([mode, range.from?.getTime(), range.to?.getTime(), query.trim(), preset, mailbox]);
+  const pageCacheKey = (key: string, continuation?: string) => `${key}::${continuation ?? "first"}`;
 
   const requestPage = async (mode: RangeMode, range: DateRange, continuation: string | undefined, query: string, preset: "all" | "15" | "30", mailbox: Folder) => {
     const resolved = query.trim() || preset === "all" ? null : resolveDateRange(mode, range, new Date(), preset === "15" ? 15 : 30);
@@ -87,7 +110,7 @@ export function Dashboard({ user }: { user: User }) {
       params.set("from", toGmailBoundary(resolved.from, true));
       params.set("to", toGmailBoundary(resolved.to));
     }
-    if (preset === "all" && !query.trim()) params.set("allTime", "true");
+    if (preset === "all" || query.trim()) params.set("allTime", "true");
     if (query.trim()) params.set("search", query.trim());
     params.set("folder", mailbox);
     if (continuation) params.set("pageToken", continuation);
@@ -97,40 +120,54 @@ export function Dashboard({ user }: { user: User }) {
     return data;
   };
 
-  const prefetchPage = async (key: string, pageToken: string | undefined, mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) => {
-    if (!pageToken || prefetchingPage.current === `${key}:${pageToken}`) return;
-    if (prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === pageToken) return;
-    const prefetchKey = `${key}:${pageToken}`;
-    prefetchingPage.current = prefetchKey;
+  const prefetchPages = async (key: string, pageToken: string | undefined, mode: RangeMode, range: DateRange, query: string, preset: "all" | "15" | "30", mailbox: Folder) => {
+    if (!pageToken || prefetchingPages.current.has(key)) return;
+    prefetchingPages.current.add(key);
     try {
-      const data = await requestPage(mode, range, pageToken, query, preset, mailbox);
-      if (data && activeRequestKey.current === key) prefetchedPage.current = { key, pageToken, data };
+      let continuation: string | undefined = pageToken;
+      for (let page = 0; page < 2 && continuation; page += 1) {
+        if (activeRequestKey.current !== key) return;
+        const cacheKey = pageCacheKey(key, continuation);
+        const cachedEntry = messageCache.current.get(cacheKey);
+        const cached = cachedEntry && Date.now() - cachedEntry.cachedAt < MESSAGE_CACHE_TTL_MS ? cachedEntry.data : null;
+        if (cachedEntry && !cached) messageCache.current.delete(cacheKey);
+        const data: MessagePage | null = cached ?? await requestPage(mode, range, continuation, query, preset, mailbox);
+        if (!data) return;
+        if (!cached) messageCache.current.set(cacheKey, { data, cachedAt: Date.now() });
+        continuation = data.nextPageToken;
+      }
     } catch {
-      // A look-ahead request is opportunistic; the explicit Load More action retries it if needed.
+      // Background look-ahead is opportunistic; pagination retries it if needed.
     } finally {
-      if (prefetchingPage.current === prefetchKey) prefetchingPage.current = "";
+      prefetchingPages.current.delete(key);
     }
   };
 
-  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset, mailbox: Folder = folder) => {
+  const loadMessages = async (mode: RangeMode = rangeMode, range: DateRange = dateRange, append = false, continuation?: string, query = searchQuery, preset = timePreset, mailbox: Folder = folder, forceRefresh = false) => {
     const currentRequest = ++requestNumber.current;
     const key = requestKey(mode, range, query, preset, mailbox);
     activeRequestKey.current = key;
-    if (!append) prefetchedPage.current = null;
     if (append) setLoadingMore(true);
     else setLoading(true);
     setPageError("");
     if (!append) setError("");
     try {
-      const cached = append && continuation && prefetchedPage.current?.key === key && prefetchedPage.current.pageToken === continuation ? prefetchedPage.current.data : null;
+      const cacheKey = pageCacheKey(key, continuation);
+      if (forceRefresh) {
+        for (const cachedKey of messageCache.current.keys()) if (cachedKey.startsWith(`${key}::`)) messageCache.current.delete(cachedKey);
+      }
+      const cachedEntry = !append && !forceRefresh ? messageCache.current.get(cacheKey) : undefined;
+      const cached = cachedEntry && Date.now() - cachedEntry.cachedAt < MESSAGE_CACHE_TTL_MS ? cachedEntry.data : null;
+      if (cachedEntry && !cached) messageCache.current.delete(cacheKey);
       const data = cached ?? await requestPage(mode, range, continuation, query, preset, mailbox);
       if (!data) return;
-      if (cached) prefetchedPage.current = null;
+      if (!append && !cached) messageCache.current.set(cacheKey, { data, cachedAt: Date.now() });
       if (currentRequest !== requestNumber.current) return;
       setMessages((existing) => append ? [...existing, ...(data.messages ?? [])] : (data.messages ?? []));
       if (!append && mailbox === "inbox") setInboxUnreadCount((data.messages ?? []).filter((message) => message.isUnread).length);
       setNextPageToken(data.nextPageToken);
-      if (data.nextPageToken) void prefetchPage(key, data.nextPageToken, mode, range, query, preset, mailbox);
+      setTotalPages(Math.max(pageNumber, 1, Math.ceil((data.resultSizeEstimate ?? data.messages?.length ?? 0) / MESSAGE_PAGE_SIZE)));
+      if (data.nextPageToken) void prefetchPages(key, data.nextPageToken, mode, range, query, preset, mailbox);
       if (!append) { setSelected(null); setSummary(""); }
     } catch (caught) {
       if (currentRequest !== requestNumber.current) return;
@@ -155,31 +192,51 @@ export function Dashboard({ user }: { user: User }) {
   const send = async (form: HTMLFormElement) => { const values = new FormData(form); setSending(true); setNotice(""); try { const response = await fetch("/api/gmail/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: values.get("to"), subject: values.get("subject"), body: values.get("body") }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error); form.reset(); setNotice("Email sent successfully."); } catch (caught) { setNotice(caught instanceof Error ? caught.message : "We couldn't send the email. Please try again."); } finally { setSending(false); } };
 
   const visibleMessages = messages;
+  const showInitialSkeleton = loading && messages.length === 0 && !searchQuery.trim();
   const closeReader = () => { setSelected(null); setAccessGuard(null); setContentScan(null); setSummary(""); };
   const folderLabel: Record<Folder, string> = { inbox: "Inbox", sent: "Sent", drafts: "Drafts", trash: "Trash", spam: "Spam", starred: "Starred", archive: "Archive" };
+  const reconnectGmail = async () => {
+    await signOut({ redirect: false });
+    await signIn("google", { callbackUrl: "/dashboard" }, { access_type: "offline", prompt: "consent" });
+  };
+  const resetPagination = () => { setPageNumber(1); setTotalPages(1); setPageStartTokens([undefined]); };
+  const goToNextPage = () => {
+    if (!nextPageToken || loading) return;
+    const nextPage = pageNumber + 1;
+    setPageStartTokens((tokens) => tokens.length > nextPage ? tokens : [...tokens, nextPageToken]);
+    setPageNumber(nextPage);
+    void loadMessages(rangeMode, dateRange, false, nextPageToken);
+  };
+  const goToPreviousPage = () => {
+    if (pageNumber <= 1 || loading) return;
+    const previousPage = pageNumber - 1;
+    setPageNumber(previousPage);
+    void loadMessages(rangeMode, dateRange, false, pageStartTokens[previousPage - 1]);
+  };
+  const refreshCurrentPage = () => void loadMessages(rangeMode, dateRange, false, pageStartTokens[pageNumber - 1], searchQuery, timePreset, folder, true);
 
-  return <SidebarProvider defaultOpen style={{ "--sidebar-width": "17rem" } as React.CSSProperties}>
-    <AppSidebar user={user} view={view} folder={folder} unreadCount={inboxUnreadCount} onFolderChange={(next) => { setFolder(next); setSearchQuery(""); void loadMessages(rangeMode, dateRange, false, undefined, "", timePreset, next); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") closeReader(); }} onRefresh={() => void loadMessages()} />
+  return <SidebarProvider defaultOpen style={{ "--sidebar-width": "14rem" } as React.CSSProperties}>
+    <AppSidebar user={user} view={view} folder={folder} unreadCount={inboxUnreadCount} onFolderChange={(next) => { setFolder(next); setSearchQuery(""); resetPagination(); void loadMessages(rangeMode, dateRange, false, undefined, "", timePreset, next); }} onViewChange={(nextView) => { setView(nextView); if (nextView === "compose") closeReader(); }} onRefresh={refreshCurrentPage} />
     <SidebarInset className="min-w-0 bg-[#171721]">
-      <header className="sticky top-0 z-10 flex min-h-16 shrink-0 items-center gap-8 border-b border-white/10 bg-[#171721]/90 px-5 py-3 backdrop-blur-xl md:px-8">
-        <SidebarTrigger aria-label="Main menu" title="Main menu" className="size-10 rounded-xl bg-[#6574f5] text-white shadow-[0_0_24px_rgba(101,116,245,.3)] hover:bg-[#7180ff] hover:text-white"><Menu className="size-5" /></SidebarTrigger><Separator orientation="vertical" className="h-18 self-center !w-1 rounded-full bg-[#6574f5]/90" />
-        <div className="min-w-0 flex-1">{view === "compose" ? <><p className="text-xs font-medium uppercase tracking-[.18em] text-white/35">New message</p><p className="text-sm text-white/75">Write to someone</p></> : <RangeControls searchQuery={searchQuery} timePreset={timePreset} onPresetChange={(preset) => { setTimePreset(preset); setRangeMode("recent"); setRangeOpen(false); void loadMessages("recent", dateRange, false, undefined, searchQuery, preset); }} rangeMode={rangeMode} dateRange={dateRange} rangeOpen={rangeOpen} setRangeOpen={setRangeOpen} setDateRange={setDateRange} onCustomRange={(range) => { setRangeMode("period"); setTimePreset("30"); setRangeOpen(false); void loadMessages("period", range); }} />}</div>
+      <header className="sticky top-0 z-10 flex min-h-12 shrink-0 items-center gap-4 border-b border-white/10 bg-[#171721]/90 px-4 py-2 backdrop-blur-xl md:px-6">
+        <SidebarTrigger aria-label="Main menu" title="Main menu" className="size-8 rounded-xl bg-[#6574f5] text-white shadow-[0_0_20px_rgba(101,116,245,.28)] hover:bg-[#7180ff] hover:text-white"><Menu className="size-4" /></SidebarTrigger><Separator orientation="vertical" className="my-auto h-8 !w-px rounded-full bg-[#6574f5]/90" />
+        <div className="min-w-0 flex-1">{view === "compose" ? <><p className="text-xs font-medium uppercase tracking-[.18em] text-white/35">New message</p><p className="text-sm text-white/75">Write to someone</p></> : <RangeControls searchQuery={searchQuery} timePreset={timePreset} onPresetChange={(preset) => { setTimePreset(preset); setRangeMode("recent"); setRangeOpen(false); resetPagination(); void loadMessages("recent", dateRange, false, undefined, searchQuery, preset); }} rangeMode={rangeMode} dateRange={dateRange} rangeOpen={rangeOpen} setRangeOpen={setRangeOpen} setDateRange={setDateRange} onCustomRange={(range) => { setRangeMode("period"); setTimePreset("30"); setRangeOpen(false); resetPagination(); void loadMessages("period", range); }} />}</div>
       </header>
-      <main className="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6 lg:p-8">
-        {view === "compose" ? <ComposeForm sending={sending} notice={notice} onCancel={() => setView("inbox")} onSend={send} /> : error ? <div className="error-card"><p>{error}</p>{error.includes("connection") && <button className="button button-primary" onClick={() => signIn("google", { callbackUrl: "/dashboard" })}>Reconnect Gmail</button>}</div> : loading ? <SkeletonRows /> : <MessageList folderLabel={folderLabel[folder]} messages={visibleMessages} query={searchQuery} searching={loading} hasMore={Boolean(nextPageToken)} loadingMore={loadingMore} pageError={pageError} onSearch={(query) => { setSearchQuery(query); void loadMessages(rangeMode, dateRange, false, undefined, query); }} onSelectMessage={(message) => void openEmail(message)} onLoadMore={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} onRetryPage={() => { if (nextPageToken) void loadMessages(rangeMode, dateRange, true, nextPageToken); }} />}
+      <main className="mx-auto w-full max-w-6xl flex-1 p-3 md:p-5 lg:p-6">
+        {view === "compose" ? <ComposeForm sending={sending} notice={notice} onCancel={() => setView("inbox")} onSend={send} /> : error ? <div className="error-card"><p>{error}</p>{error.includes("connection") && <button className="button button-primary" onClick={() => void reconnectGmail()}>Reconnect Gmail</button>}</div> : showInitialSkeleton ? <SkeletonRows /> : <MessageList folderLabel={folderLabel[folder]} messages={visibleMessages} query={searchQuery} searching={loading && Boolean(searchQuery.trim())} pageNumber={pageNumber} totalPages={totalPages} canGoPrevious={pageNumber > 1} canGoNext={Boolean(nextPageToken)} loadingPage={loading} pageError={pageError} onSearch={(query) => { setSearchQuery(query); resetPagination(); void loadMessages(rangeMode, dateRange, false, undefined, query); }} onSelectMessage={(message) => void openEmail(message)} onPreviousPage={goToPreviousPage} onNextPage={goToNextPage} onRetryPage={refreshCurrentPage} />}
       </main>
     </SidebarInset>
     {selected && <Sheet open onOpenChange={(open) => { if (!open) closeReader(); }}><SheetContent side="right" className="w-full gap-0 overflow-hidden border-white/10 bg-[#1e1e2a] p-0 text-white sm:!max-w-none md:w-[62vw] md:max-w-[980px]"><SheetTitle className="sr-only">{selected.subject}</SheetTitle><div className="flex-1 overflow-y-auto p-4 md:p-6"><Reader message={selected} accessGuard={accessGuard} contentScan={contentScan} onGrantAccess={() => void grantMessagePermission()} onRetryAssessment={() => void openEmail(selected)} onKeepClosed={closeReader} summary={summary} summarizing={summarizing} onSummarize={() => void generateSummary()} /></div></SheetContent></Sheet>}
   </SidebarProvider>;
 }
 
-function MessageList({ folderLabel, messages, query, searching, hasMore, loadingMore, pageError, onSearch, onSelectMessage, onLoadMore, onRetryPage }: { folderLabel: string; messages: Message[]; query: string; searching: boolean; hasMore: boolean; loadingMore: boolean; pageError: string; onSearch: (query: string) => void; onSelectMessage: (message: Message) => void; onLoadMore: () => void; onRetryPage: () => void }) {
-  return <section className="overflow-hidden rounded-2xl border border-white/10 bg-[#1e1e2a] shadow-2xl shadow-black/10"><div className="border-b border-white/10 p-5 md:p-6"><div className="flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">{folderLabel.toUpperCase()}</p><h1 className="mt-1 text-2xl font-medium tracking-tight text-white md:text-3xl">{folderLabel}</h1><p className="mt-1 text-sm text-white/45">{messages.length} messages in this view</p></div><label className="relative w-full max-w-sm"><span className="sr-only">Search messages</span><input value={query} onChange={(event) => onSearch(event.target.value)} placeholder={`Search ${folderLabel.toLowerCase()}…`} className="h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white outline-none transition-colors placeholder:text-white/35 focus:border-[#6574f5]/70" /></label></div></div><div>{messages.length === 0 ? <div className="empty-state border-0 bg-transparent"><Mail size={26}/><h2>{searching ? "Searching messages…" : `No messages in ${folderLabel.toLowerCase()}`}</h2><p>{query ? "Try a different search phrase." : "This folder is currently empty."}</p></div> : messages.map((message) => <button key={message.id} type="button" onClick={() => onSelectMessage(message)} className="group grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-white/8 px-5 py-4 text-left transition-colors hover:bg-white/6 md:px-6"><span className={`row-span-2 flex size-9 items-center justify-center rounded-full text-xs font-semibold ${message.isUnread ? "bg-[#6574f5] text-white" : "bg-white/10 text-white/60"}`}>{initial(message.sender)}</span><span className={`min-w-0 truncate text-sm ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}>{message.sender || "Unknown sender"}</span><time className="text-xs text-white/40">{formatDate(message.receivedAt)}</time><span className={`col-start-2 min-w-0 truncate text-sm ${message.isUnread ? "font-medium text-white/90" : "text-white/55"}`}>{message.subject}<span className="ml-2 text-white/35">— {message.snippet}</span></span></button>)}</div>{pageError && <div className="px-5 py-4 text-sm text-red-200/80"><p>This page could not be loaded.</p><button type="button" className="mt-2 text-[#aeb8ff] underline underline-offset-2" onClick={onRetryPage}>Retry</button></div>}{hasMore && <div className="p-4 text-center"><button type="button" className="button button-ghost" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? <><LoaderCircle className="spin" size={15} /> Loading…</> : "Load more messages"}</button></div>}</section>
+function MessageList({ folderLabel, messages, query, searching, pageNumber, totalPages, canGoPrevious, canGoNext, loadingPage, pageError, onSearch, onSelectMessage, onPreviousPage, onNextPage, onRetryPage }: { folderLabel: string; messages: Message[]; query: string; searching: boolean; pageNumber: number; totalPages: number; canGoPrevious: boolean; canGoNext: boolean; loadingPage: boolean; pageError: string; onSearch: (query: string) => void; onSelectMessage: (message: Message) => void; onPreviousPage: () => void; onNextPage: () => void; onRetryPage: () => void }) {
+  return <section className="inbox-message-list overflow-hidden rounded border border-white/10 bg-[#1e1e2a] shadow-xl shadow-[#6574f5]/30"><div className="inbox-list-header border-b border-white/10 p-4 shadow-xl shadow-black/80 md:p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h1 className="text-xl font-semibold tracking-tight text-white md:text-2xl">{folderLabel}</h1><p className="mt-1 text-xs text-white/50">{messages.length} messages in this view</p></div><div className="flex items-center gap-2"><label className="relative w-full max-w-sm"><span className="sr-only">Search messages</span><input value={query} onChange={(event) => onSearch(event.target.value)} placeholder={`Search ${folderLabel.toLowerCase()}…`} className="h-6 w-80 rounded-full border border-white/30 bg-[#6574f5] px-3 text-sm text-black/50 shadow-xl shadow-white/10 outline-none transition-colors placeholder:text-sm placeholder:text-black/50 focus:border-[#6574f5]/60" /></label><div className="-translate-y-0.5 flex items-center gap-0.5 text-[10px] text-white/45"><button type="button" aria-label="Previous page" onClick={onPreviousPage} disabled={!canGoPrevious || loadingPage} className="rounded-full px-1.5 py-0.5 transition-colors hover:bg-[#6574f5]/15 hover:text-white disabled:cursor-not-allowed disabled:opacity-30">‹</button>{loadingPage && <LoaderCircle className="spin size-3 text-[#aeb8ff]" aria-label="Loading page" />}<span className="min-w-7 text-center" aria-live="polite">{pageNumber}/{totalPages}</span><button type="button" aria-label="Next page" onClick={onNextPage} disabled={!canGoNext || loadingPage} className="rounded-full px-1.5 py-0.5 transition-colors hover:bg-[#6574f5]/15 hover:text-white disabled:cursor-not-allowed disabled:opacity-30">›</button></div></div></div></div><div>{messages.length === 0 ? <div className="empty-state border-0 bg-transparent"><Mail size={26}/><h2>{searching ? "Searching messages…" : `No messages in ${folderLabel.toLowerCase()}`}</h2><p>{query ? "Try a different search phrase." : "This folder is currently empty."}</p></div> : messages.map((message) => <button key={message.id} type="button" onClick={() => onSelectMessage(message)} className="group grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-white/8 px-4 py-3.5 text-left shadow-xl shadow-black/80 transition-colors hover:bg-[#6574f5]/10 md:px-6"><span className={`row-span-2 flex size-8 items-center justify-center rounded-full bg-gradient-to-br from-[#8290ff] via-[#6574f5] to-[#4556d9] text-xs font-semibold text-white shadow-[0_4px_10px_rgba(101,116,245,.35)] ${message.isUnread ? "" : "bg-none bg-white/10 text-white/60 shadow-none"}`}>{initial(message.sender)}</span><span className={`min-w-0 truncate text-[13px] ${message.isUnread ? "font-semibold text-white" : "text-white/75"}`}><HighlightedText text={message.sender || "Unknown sender"} query={query} /></span><time className="text-[9px] text-white/55">{formatDate(message.receivedAt)}</time><span className={`col-start-2 min-w-0 truncate text-[13px] ${message.isUnread ? "font-medium text-white/90" : "text-white/55"}`}><HighlightedText text={message.subject} query={query} /><span className="ml-2 text-white/35">— <HighlightedText text={message.snippet} query={query} /></span></span></button>)}</div>{pageError && <div className="px-5 py-4 text-sm text-red-200/80"><p>This page could not be loaded.</p><button type="button" className="mt-2 text-[#aeb8ff] underline underline-offset-2" onClick={onRetryPage}>Retry</button></div>}</section>
 }
 
 function RangeControls({ searchQuery, timePreset, onPresetChange, rangeMode, dateRange, rangeOpen, setRangeOpen, setDateRange, onCustomRange }: { searchQuery: string; timePreset: "all" | "15" | "30"; onPresetChange: (preset: "all" | "15" | "30") => void; rangeMode: RangeMode; dateRange: DateRange; rangeOpen: boolean; setRangeOpen: (open: boolean) => void; setDateRange: (range: DateRange) => void; onCustomRange: (range: DateRange) => void }) {
   const currentLabel = searchQuery.trim() || timePreset === "all" ? "All Time" : timePreset === "15" ? "Last 15 days" : timePreset === "30" && rangeMode === "recent" ? "Last 30 days" : dateRange.from && dateRange.to ? `${shortDate(dateRange.from)} – ${shortDate(dateRange.to)}` : "Choose date range";
-  return <div className="relative flex flex-wrap items-center gap-2"><DropdownMenu><DropdownMenuTrigger className="flex items-center gap-1 rounded-md px-2 py-1.5 text-sm text-white/75 hover:bg-white/8 hover:text-white">{timePreset === "all" ? "All Time" : timePreset === "15" ? "Last 15 days" : "Last 30 days"}<ChevronDown className="size-3" /></DropdownMenuTrigger><DropdownMenuContent><DropdownMenuItem onClick={() => onPresetChange("all")}>All Time</DropdownMenuItem><DropdownMenuItem onClick={() => onPresetChange("15")}>Last 15 days</DropdownMenuItem><DropdownMenuItem onClick={() => onPresetChange("30")}>Last 30 days</DropdownMenuItem></DropdownMenuContent></DropdownMenu><DropdownMenu open={rangeOpen} onOpenChange={setRangeOpen}><DropdownMenuTrigger className="flex items-center gap-1 rounded-md px-2 py-1.5 text-sm text-white/55 hover:bg-white/8 hover:text-white"><CalendarDays className="size-3" /> Custom date range</DropdownMenuTrigger><DropdownMenuContent className="w-auto p-3"><Calendar selected={dateRange} onSelect={(next) => { setDateRange(next); if (next.from && next.to) onCustomRange(next); }} numberOfMonths={2} /></DropdownMenuContent></DropdownMenu><span className="basis-full text-xs text-white/45">{currentLabel}</span></div>
+  return <div className="relative flex flex-wrap items-center gap-2"><DropdownMenu><DropdownMenuTrigger aria-label={`Date filter: ${currentLabel}`} className="group flex h-8 w-9 items-center gap-2 overflow-hidden rounded-full px-2 text-sm text-white/75 transition-[width,background-color] duration-200 hover:w-36 hover:bg-[#6574f5]/15 hover:text-white focus-visible:w-36 focus-visible:bg-[#6574f5]/15 data-[state=open]:w-36 data-[state=open]:bg-[#6574f5]/15"><CalendarClock className="size-4 shrink-0" /><span className="max-w-0 overflow-hidden whitespace-nowrap opacity-0 transition-[max-width,opacity] duration-200 group-hover:max-w-28 group-hover:opacity-100 group-focus-visible:max-w-28 group-focus-visible:opacity-100 group-data-[state=open]:max-w-28 group-data-[state=open]:opacity-100">{timePreset === "all" ? "All Time" : timePreset === "15" ? "Last 15 days" : "Last 30 days"}</span><ChevronDown className="size-3 shrink-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100 group-data-[state=open]:opacity-100" /></DropdownMenuTrigger><DropdownMenuContent><DropdownMenuItem onClick={() => onPresetChange("all")}>All Time</DropdownMenuItem><DropdownMenuItem onClick={() => onPresetChange("15")}>Last 15 days</DropdownMenuItem><DropdownMenuItem onClick={() => onPresetChange("30")}>Last 30 days</DropdownMenuItem></DropdownMenuContent></DropdownMenu><DropdownMenu open={rangeOpen} onOpenChange={setRangeOpen}><DropdownMenuTrigger aria-label="Custom date range" className="group flex h-8 w-9 items-center gap-2 overflow-hidden rounded-full px-2 text-sm text-white/55 transition-[width,background-color] duration-200 hover:w-44 hover:bg-[#6574f5]/15 hover:text-white focus-visible:w-44 focus-visible:bg-[#6574f5]/15 data-[state=open]:w-44 data-[state=open]:bg-[#6574f5]/15"><CalendarDays className="size-4 shrink-0" /><span className="max-w-0 overflow-hidden whitespace-nowrap opacity-0 transition-[max-width,opacity] duration-200 group-hover:max-w-32 group-hover:opacity-100 group-focus-visible:max-w-32 group-focus-visible:opacity-100 group-data-[state=open]:max-w-32 group-data-[state=open]:opacity-100">Custom date range</span></DropdownMenuTrigger><DropdownMenuContent className="w-auto p-3"><Calendar selected={dateRange} onSelect={(next) => { setDateRange(next); if (next.from && next.to) onCustomRange(next); }} numberOfMonths={2} /></DropdownMenuContent></DropdownMenu><span className="basis-full text-xs text-white/45">{currentLabel}</span></div>
 }
 
 function ComposeForm({ sending, notice, onCancel, onSend }: { sending: boolean; notice: string; onCancel: () => void; onSend: (form: HTMLFormElement) => void }) {
@@ -192,6 +249,7 @@ function AgentDraftForm({ onCancel }: { onCancel: () => void }) {
   const resumeSessionId = typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("resume");
   const sessionId = useRef(resumeSessionId && /^[0-9a-f-]{36}$/i.test(resumeSessionId) ? resumeSessionId : crypto.randomUUID());
   const previousUuid = useRef<string | null>(null);
+  const draftUuid = useRef<string | null>(null);
   const [request, setRequest] = useState("");
   const [draft, setDraft] = useState<AgentDraft | null>(null);
   const [draftToken, setDraftToken] = useState("");
@@ -218,11 +276,11 @@ function AgentDraftForm({ onCancel }: { onCancel: () => void }) {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [resumeSessionId]);
-  const saveLog = async (type: "user" | "assistant", content: string | Record<string, unknown>) => { const uuid = await appendConversationLog({ type, sessionId: sessionId.current, parentUuid: previousUuid.current, content }); if (uuid) previousUuid.current = uuid; };
-  const createDraft = async () => { setWorking(true); setStatus(""); setClarification(""); await saveLog("user", request); try { const response = await fetch("/api/agent/draft", { method: "POST", headers: { "Content-Type": "application/json", "X-Conversation-Session": sessionId.current }, body: JSON.stringify({ request, context }) }); const data = await response.json() as { draft?: AgentDraft; draftToken?: string; clarification?: string; error?: string }; if (!response.ok) throw new Error(data.error); if (data.clarification) { setClarification(data.clarification); await saveLog("assistant", data.clarification); } else if (data.draft && data.draftToken) { setDraft(data.draft); setDraftToken(data.draftToken); setEdited(false); setSent(false); setIdempotencyKey(""); await saveLog("assistant", data.draft); } } catch (caught) { const message = caught instanceof Error ? caught.message : "We couldn't create a draft."; setStatus(message); await saveLog("assistant", message); } finally { setWorking(false); } };
-  const sendDraft = async () => { if (!draft || !draftToken) return; setWorking(true); setStatus(""); const key = idempotencyKey || crypto.randomUUID(); setIdempotencyKey(key); try { const response = await fetch("/api/agent/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...draft, draftToken, idempotencyKey: key }) }); const data = await response.json() as { error?: string }; if (!response.ok) throw new Error(data.error); setSent(true); setStatus("Email sent successfully."); await saveLog("assistant", `Email sent successfully to ${draft.to}.`); } catch (caught) { const errorMessage = caught instanceof Error ? caught.message : "We couldn't send the email. Your draft is preserved."; setStatus(errorMessage); await saveLog("assistant", `Email send failed for ${draft.to}: ${errorMessage}`); } finally { setWorking(false); } };
+  const saveLog = async (type: "user" | "assistant", content: string | Record<string, unknown>) => { const uuid = await appendConversationLog({ type, sessionId: sessionId.current, parentUuid: previousUuid.current, content }); if (uuid) previousUuid.current = uuid; return uuid; };
+  const createDraft = async () => { setWorking(true); setStatus(""); setClarification(""); draftUuid.current = null; await saveLog("user", request); try { const response = await fetch("/api/agent/draft", { method: "POST", headers: { "Content-Type": "application/json", "X-Conversation-Session": sessionId.current }, body: JSON.stringify({ request, context }) }); const data = await response.json() as { draft?: AgentDraft; draftToken?: string; clarification?: string; error?: string }; if (!response.ok) throw new Error(data.error); if (data.clarification) { setClarification(data.clarification); await saveLog("assistant", data.clarification); } else if (data.draft && data.draftToken) { setDraft(data.draft); setDraftToken(data.draftToken); setEdited(false); setSent(false); setIdempotencyKey(""); draftUuid.current = await saveLog("assistant", { event: "email_draft", draft: data.draft, requiresConfirmation: true }); } } catch (caught) { const message = caught instanceof Error ? caught.message : "We couldn't create a draft."; setStatus(message); await saveLog("assistant", message); } finally { setWorking(false); } };
+  const sendDraft = async () => { if (!draft || !draftToken) return; setWorking(true); setStatus(""); const key = idempotencyKey || crypto.randomUUID(); setIdempotencyKey(key); try { const response = await fetch("/api/agent/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...draft, draftToken, idempotencyKey: key }) }); const data = await response.json() as { error?: string }; if (!response.ok) throw new Error(data.error); setSent(true); setStatus("Email sent successfully."); await saveLog("assistant", { event: "email_sent", draftUuid: draftUuid.current, idempotencyKey: key, message: `Email sent successfully to ${draft.to}.` }); } catch (caught) { const errorMessage = caught instanceof Error ? caught.message : "We couldn't send the email. Your draft is preserved."; setStatus(errorMessage); await saveLog("assistant", `Email send failed for ${draft.to}: ${errorMessage}`); } finally { setWorking(false); } };
   const markEdited = () => { setEdited(true); setSent(false); setStatus("Draft changed. Create a new draft before sending."); };
-  const resetDraft = () => { setDraft(null); setDraftToken(""); setEdited(false); setSent(false); setStatus(""); setIdempotencyKey(""); };
+  const resetDraft = () => { setDraft(null); setDraftToken(""); draftUuid.current = null; setEdited(false); setSent(false); setStatus(""); setIdempotencyKey(""); };
   return <div className="agent-compose"><BubbleGroup className="conversation-preview">{request && <Bubble align="end"><BubbleContent className="bg-[#6574f5] text-white">{request}</BubbleContent></Bubble>}{working && <Shimmer>Generating response…</Shimmer>}</BubbleGroup><label>What should the email say?<textarea value={request} onChange={(event) => { setRequest(event.target.value); resetDraft(); setClarification(""); }} placeholder="Write to alex@example.com thanking them for the introduction. Keep it warm and concise." required /></label>{clarification && <div className="agent-clarification"><Sparkles size={15} /><span>{clarification}</span></div>}{draft && <div className="agent-draft"><div className="agent-draft-label"><Sparkles size={14} /> Review AI draft before sending</div><label>To<input value={draft.to} onChange={(event) => { setDraft({ ...draft, to: event.target.value }); markEdited(); }} /></label><label>Subject<input value={draft.subject} onChange={(event) => { setDraft({ ...draft, subject: event.target.value }); markEdited(); }} /></label><label>Message<textarea value={draft.body} onChange={(event) => { setDraft({ ...draft, body: event.target.value }); markEdited(); }} /></label>{draft.assumptions.length > 0 && <div className="agent-assumptions"><strong>Assumptions to review</strong><ul>{draft.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul></div>}{edited && <p className="agent-clarification">This reviewed version changed. Create a new draft to refresh the confirmation.</p>}{!sent && <button type="button" className="button button-primary" onClick={() => void sendDraft()} disabled={working || edited || !draftToken || !draft.to || !draft.subject || !draft.body}>{working ? <><LoaderCircle className="spin" size={16} /> Sending…</> : <><Send size={16} /> Send reviewed email</>}</button>}{edited && <button type="button" className="button button-ghost" onClick={() => void createDraft()} disabled={working || !request.trim()}>{working ? "Writing…" : "Create new draft"}</button>}</div>}{status && <p className="form-notice">{status}</p>}<div className="compose-actions"><button type="button" className="button button-ghost" onClick={onCancel}>Cancel</button>{!draft && <button type="button" className="button button-primary" onClick={() => void createDraft()} disabled={working || !request.trim()}>{working ? <><LoaderCircle className="spin" size={16} /> Writing…</> : <><Sparkles size={16} /> Create draft</>}</button>}</div></div>
 }
 

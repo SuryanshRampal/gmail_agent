@@ -31,8 +31,10 @@ CREATE TABLE next_auth.accounts (
   session_state text,
   oauth_token_secret text,
   oauth_token text,
+  oauth_environment text NOT NULL DEFAULT 'legacy',
   userId uuid,
   CONSTRAINT accounts_pkey PRIMARY KEY (id),
+  CONSTRAINT provider_environment_unique UNIQUE (provider, "providerAccountId", oauth_environment),
   CONSTRAINT accounts_userId_fkey FOREIGN KEY (userId) REFERENCES next_auth.users(id)
 );
 CREATE TABLE next_auth.verification_tokens (
