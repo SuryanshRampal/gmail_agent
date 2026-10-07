@@ -1,13 +1,14 @@
 import { db } from "@/lib/db";
 import { decryptToken, encryptToken } from "@/lib/encryption";
 import { googleOAuthCredentials } from "@/lib/auth";
+import { clearOAuthAccountTokens } from "@/lib/auth/oauth-account-store";
 import { oauthEnvironment } from "@/lib/oauth-environment";
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 export class GmailConnectionError extends Error {}
-export type GmailMessage = { id: string; threadId: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean; replyTo?: string; returnPath?: string; authenticationResults?: string; body?: string; bodyHtml?: string; bodyText?: string };
+export type GmailMessage = { id: string; threadId: string; sender: string; recipients: string; subject: string; receivedAt: string; snippet: string; isUnread: boolean; isSent: boolean; isDraft: boolean; replyTo?: string; returnPath?: string; authenticationResults?: string; messageIdHeader?: string; references?: string; body?: string; bodyHtml?: string; bodyText?: string };
 
 type StoredAccount = { access_token: string | null; refresh_token: string | null; expires_at: number | null };
 export type GmailRequestContext = { requestId?: string };
@@ -49,6 +50,14 @@ async function getAccessToken(userId: string, context?: GmailRequestContext): Pr
     let errorPayload: { error?: string; error_description?: string; error_subtype?: string } = {};
     try { errorPayload = await response.json() as typeof errorPayload; } catch { /* Keep the HTTP status when Google returns no JSON. */ }
     log(context, "Google token refresh failed", { status: response.status, statusText: response.statusText, googleError: errorPayload.error, googleErrorDescription: errorPayload.error_description, googleErrorSubtype: errorPayload.error_subtype });
+    if (errorPayload.error === "invalid_grant") {
+      try {
+        await clearOAuthAccountTokens(db, userId, "google", oauthEnvironment);
+        log(context, "cleared revoked Google account tokens", { userId, oauthEnvironment });
+      } catch (error) {
+        logError(context, "failed to clear revoked Google account tokens", error, { userId, oauthEnvironment });
+      }
+    }
     throw new GmailConnectionError("Your Gmail connection has expired. Please reconnect your account.");
   }
   const token = await response.json() as { access_token: string; expires_in: number; refresh_token?: string };
@@ -105,7 +114,7 @@ async function messageFromGoogle(userId: string, message: any, resolveImages = f
   const labels = message.labelIds ?? [];
   const bodies = extractBodies(message.payload);
   const bodyHtml = resolveImages ? await inlineImages(userId, message, bodies.html, context) : bodies.html;
-  return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), replyTo: header(message.payload?.headers, "Reply-To"), returnPath: header(message.payload?.headers, "Return-Path"), authenticationResults: header(message.payload?.headers, "Authentication-Results"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
+  return { id: message.id, threadId: message.threadId, sender: header(message.payload?.headers, "From"), recipients: header(message.payload?.headers, "To"), subject: header(message.payload?.headers, "Subject") || "(No subject)", receivedAt: header(message.payload?.headers, "Date"), snippet: message.snippet ?? "", isUnread: labels.includes("UNREAD"), isSent: labels.includes("SENT"), isDraft: labels.includes("DRAFT"), replyTo: header(message.payload?.headers, "Reply-To"), returnPath: header(message.payload?.headers, "Return-Path"), authenticationResults: header(message.payload?.headers, "Authentication-Results"), messageIdHeader: header(message.payload?.headers, "Message-ID"), references: header(message.payload?.headers, "References"), body: bodyHtml || bodies.text, bodyHtml, bodyText: bodies.text };
 }
 
 export type MailboxFolder = "inbox" | "sent" | "drafts" | "trash" | "spam" | "starred" | "archive";
@@ -148,7 +157,7 @@ export async function getEmails(userId: string, range: EmailRange = {}, context?
   ids.push(...(list.messages ?? []));
   log(context, "Gmail inbox list parsed", { messageCount: ids.length, query, hasNextPage: Boolean(list.nextPageToken), resultSizeEstimate: list.resultSizeEstimate });
   const metadataParams = new URLSearchParams({ format: "metadata" });
-  for (const name of ["From", "To", "Subject", "Date", "Reply-To", "Return-Path", "Authentication-Results"]) metadataParams.append("metadataHeaders", name);
+  for (const name of ["From", "To", "Subject", "Date", "Reply-To", "Return-Path", "Authentication-Results", "Message-ID", "References"]) metadataParams.append("metadataHeaders", name);
   const emails: GmailMessage[] = [];
   for (let index = 0; index < ids.length; index += 2) {
     const batch = ids.slice(index, index + 2);
@@ -166,8 +175,9 @@ export async function getEmail(userId: string, messageId: string, context?: Gmai
   log(context, "Gmail message payload parsed", { messageId, hasPayload: Boolean(message?.payload), partCount: message?.payload?.parts?.length ?? 0, labelCount: message?.labelIds?.length ?? 0 });
   return messageFromGoogle(userId, message, true, context);
 }
-export async function sendEmail(userId: string, email: { to: string; subject: string; body: string }, idempotencyKey?: string) {
+export async function sendEmail(userId: string, email: { to: string; subject: string; body: string; threadId?: string; inReplyTo?: string; references?: string }, idempotencyKey?: string) {
   const messageId = idempotencyKey ? `<gmail-agent-${idempotencyKey}@localhost>` : undefined;
-  const raw = Buffer.from([`To: ${email.to}`, `Subject: ${email.subject}`, ...(messageId ? [`Message-ID: ${messageId}`] : []), "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", email.body].join("\r\n")).toString("base64url");
-  return (await gmailFetch(userId, "/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ raw }) })).json();
+  const safeHeader = (value: string) => value.replace(/[\r\n]+/g, " ").trim();
+  const raw = Buffer.from([`To: ${safeHeader(email.to)}`, `Subject: ${safeHeader(email.subject)}`, ...(email.inReplyTo ? [`In-Reply-To: ${safeHeader(email.inReplyTo)}`] : []), ...(email.references ? [`References: ${safeHeader(email.references)}`] : []), ...(messageId ? [`Message-ID: ${messageId}`] : []), "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", email.body].join("\r\n")).toString("base64url");
+  return (await gmailFetch(userId, "/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ raw, ...(email.threadId ? { threadId: email.threadId } : {}) }) })).json();
 }

@@ -21,14 +21,16 @@ export async function GET() {
       where "UserID" = $1
       order by created_at asc, "UUID" asc
     `, [userId]);
-    const summaries = new Map<string, { sessionId: string; eventCount: number; title: string; createdAt: unknown; updatedAt: unknown }>();
+    const summaries = new Map<string, { sessionId: string; eventCount: number; title: string; sender?: string; recipients?: string; subject?: string; snippet?: string; messageId?: string; createdAt: unknown; updatedAt: unknown }>();
     for (const row of result.rows) {
       const existing = summaries.get(row.sessionId);
       const log = decodeConversationLog(row.encryptedLog, row.legacyLog);
-      const content = log && typeof log === "object" && "type" in log && log.type === "user" && "message" in log && log.message && typeof log.message === "object" && "content" in log.message && typeof log.message.content === "string" ? log.message.content : "";
-      const title = content.replace(/^Requested access assessment for email [^:]+: /, "Opened email: ").slice(0, 72).trim() || "Untitled conversation";
+      const content = log && typeof log === "object" && "type" in log && log.type === "user" && "message" in log && log.message && typeof log.message === "object" && "content" in log.message ? log.message.content : "";
+      const record = content && typeof content === "object" ? content as Record<string, unknown> : undefined;
+      const legacyTitle = typeof content === "string" ? content.replace(/^Requested access assessment for email [^:]+: /, "Opened email: ").slice(0, 72).trim() : "";
+      const title = typeof record?.subject === "string" ? record.subject.slice(0, 72) : legacyTitle || "Untitled conversation";
       if (!existing) {
-        summaries.set(row.sessionId, { sessionId: row.sessionId, eventCount: 1, title, createdAt: row.createdAt, updatedAt: row.createdAt });
+        summaries.set(row.sessionId, { sessionId: row.sessionId, eventCount: 1, title, sender: typeof record?.sender === "string" ? record.sender : undefined, recipients: typeof record?.recipients === "string" ? record.recipients : undefined, subject: typeof record?.subject === "string" ? record.subject : undefined, snippet: typeof record?.snippet === "string" ? record.snippet : undefined, messageId: typeof record?.messageId === "string" ? record.messageId : undefined, createdAt: row.createdAt, updatedAt: row.createdAt });
       } else {
         existing.eventCount += 1;
         existing.updatedAt = row.createdAt;

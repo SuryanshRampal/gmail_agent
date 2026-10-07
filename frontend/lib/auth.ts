@@ -2,6 +2,10 @@ import NextAuth, { type NextAuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 
 import { postgresAdapter } from "@/lib/auth/postgres-adapter";
+import { upsertOAuthAccountTokens } from "@/lib/auth/oauth-account-store";
+import { db } from "@/lib/db";
+import { encryptToken } from "@/lib/encryption";
+import { oauthEnvironment } from "@/lib/oauth-environment";
 
 const googleClientId = process.env.AUTH_GOOGLE_ID ?? process.env.GOOGLE_CLIENT_ID ?? process.env.Google_Client_Id;
 const googleClientSecret = process.env.AUTH_GOOGLE_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? process.env.Google_Client_Secret;
@@ -43,6 +47,12 @@ export const authOptions = {
     session({ session, token }) {
       if (session.user && token.sub) session.user.id = token.sub;
       return session;
+    },
+  },
+  events: {
+    async signIn({ user, account }) {
+      if (!account || account.provider !== "google") return;
+      await upsertOAuthAccountTokens(db, encryptToken, { ...account, userId: user.id }, oauthEnvironment);
     },
   },
   pages: { signIn: "/" },
