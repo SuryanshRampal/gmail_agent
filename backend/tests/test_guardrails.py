@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from app import guardrails
 
 
@@ -61,16 +63,42 @@ def test_classifier_flags_medical_and_personal_message(monkeypatch):
     assert result.categories == ["medical", "personal"]
 
 
-def test_classifier_failure_requires_permission_without_logging_content(monkeypatch, caplog):
+def test_ordinary_messages_open_when_classifier_is_unavailable(monkeypatch, caplog):
     def fail():
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(guardrails, "_classifier", fail)
-    secret = "account-number-123456"
-    result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id="m-3", snippet=secret)))
+    for subject in ["Check", "Hello", "Meeting tomorrow"]:
+        result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id=f"m-{subject}", subject=subject)))
+        assert result.decision == "allow"
+        assert result.categories == []
+    assert "Check" not in caplog.text
+
+
+def test_ambiguous_message_requires_permission_when_classifier_is_unavailable(monkeypatch, caplog):
+    monkeypatch.setattr(guardrails, "_classifier", lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")))
+    result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id="m-ambiguous-failure", subject="Please review this request")))
     assert result.decision == "permission_required"
     assert result.categories == []
-    assert secret not in caplog.text
+    assert "Please review this request" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        guardrails.MessageEnvelope(message_id="m-financial", subject="Bank statement"),
+        guardrails.MessageEnvelope(message_id="m-medical", subject="Clinic results"),
+        guardrails.MessageEnvelope(message_id="m-otp", snippet="Your verification code is 123456"),
+        guardrails.MessageEnvelope(message_id="m-booking", subject="Your booking confirmation"),
+        guardrails.MessageEnvelope(message_id="m-reply-to", sender="Example <alerts@example.com>", reply_to="support@different.example", subject="Please verify your account"),
+        guardrails.MessageEnvelope(message_id="m-auth", sender="Example <alerts@example.com>", authentication_results="spf=fail"),
+        guardrails.MessageEnvelope(message_id="m-link", snippet="Review https://bit.ly/check-now"),
+    ],
+)
+def test_risk_signals_stay_protected_when_classifier_is_unavailable(monkeypatch, envelope):
+    monkeypatch.setattr(guardrails, "_classifier", lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")))
+    result = asyncio.run(guardrails.preflight("user-1", envelope))
+    assert result.decision == "permission_required"
 
 
 def test_ambiguous_sensitivity_prediction_does_not_prompt(monkeypatch):

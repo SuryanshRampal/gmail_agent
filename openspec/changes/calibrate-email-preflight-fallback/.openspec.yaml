@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-07
+goal: Reduce false-positive permission prompts for ordinary low-risk email while
+  retaining strict protection for concrete sensitive and phishing signals.

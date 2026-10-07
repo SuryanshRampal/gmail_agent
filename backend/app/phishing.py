@@ -48,13 +48,16 @@ def assess_envelope(*, sender: str, reply_to: str = "", authentication_results: 
     reasons: list[str] = []
     strong_signals = 0
     medium_signals = 0
+    reply_mismatch_only = False
 
     if reply_domain and sender_domain and reply_domain != sender_domain:
         reasons.append("The reply address uses a different domain from the visible sender.")
-        strong_signals += 1
+        medium_signals += 1
+        reply_mismatch_only = True
     if AUTH_FAILURE_RE.search(authentication_results or ""):
         reasons.append("The available sender-authentication results include a failure.")
         strong_signals += 1
+        reply_mismatch_only = False
     if sender_domain.startswith("xn--") or ".xn--" in sender_domain:
         reasons.append("The sender domain uses an encoded internationalized domain name.")
         medium_signals += 1
@@ -67,38 +70,46 @@ def assess_envelope(*, sender: str, reply_to: str = "", authentication_results: 
             if not host or parsed.username or parsed.password:
                 reasons.append("A link contains an unusual or hidden destination.")
                 strong_signals += 1
+                reply_mismatch_only = False
                 continue
             if host in URL_SHORTENER_DOMAINS:
                 reasons.append("A link uses a URL-shortening service that hides its final destination.")
                 medium_signals += 1
+                reply_mismatch_only = False
             if any(host.endswith(tld.replace(" ", "")) for tld in SUSPICIOUS_TLDS):
                 reasons.append("A link uses a domain ending commonly associated with deceptive campaigns.")
                 medium_signals += 1
+                reply_mismatch_only = False
             if re.search(r"(?:login|log-in|verify|validation|password|credential|payment|wallet|security-check)", f"{host}{parsed.path}".lower()):
                 reasons.append("A link asks the recipient to sign in, verify an account, or make a payment.")
                 medium_signals += 1
+                reply_mismatch_only = False
             if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
                 reasons.append("A link points directly to an IP address instead of a named domain.")
                 strong_signals += 1
+                reply_mismatch_only = False
         except ValueError:
             reasons.append("A link has an invalid or unexpected destination format.")
             strong_signals += 1
+            reply_mismatch_only = False
 
     impersonation = re.search(r"\b(verify your account|confirm your identity|unusual activity|suspended|security alert|urgent action|act now|last warning|claim your prize)\b", text, re.I)
     credential_request = re.search(r"\b(password|one[- ]time password|otp|verification code|login credentials|bank details|card details)\b", text, re.I)
     if impersonation:
         reasons.append("The message uses urgency or account-security language.")
         medium_signals += 1
+        reply_mismatch_only = False
     if credential_request:
         reasons.append("The message appears to request credentials or payment information.")
         strong_signals += 1
+        reply_mismatch_only = False
 
     # Deduplicate while keeping telemetry and UI explanations bounded.
     reasons = list(dict.fromkeys(reasons))[:8]
     if strong_signals >= 2 or (strong_signals >= 1 and medium_signals >= 1):
         risk: PhishingRisk = "high_risk"
         confidence: PhishingConfidence = "high"
-    elif strong_signals or medium_signals >= 2:
+    elif strong_signals or (medium_signals and not reply_mismatch_only) or medium_signals >= 2:
         risk = "needs_attention"
         confidence = "medium"
     else:
