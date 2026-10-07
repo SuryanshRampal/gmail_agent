@@ -3,6 +3,7 @@ import type { Adapter, AdapterAccount, AdapterUser } from "next-auth/adapters";
 import { db } from "@/lib/db";
 import { encryptToken } from "@/lib/encryption";
 import { oauthEnvironment } from "@/lib/oauth-environment";
+import { upsertOAuthAccountTokens } from "@/lib/auth/oauth-account-store";
 
 type DbUser = { id: string; name: string | null; email: string | null; emailverified: Date | null; image: string | null };
 const toUser = (user: DbUser): AdapterUser => ({ id: user.id, name: user.name, email: user.email ?? "", emailVerified: user.emailverified, image: user.image });
@@ -31,10 +32,7 @@ export const postgresAdapter: Adapter = {
     return toUser(rows[0]);
   },
   async linkAccount(account: AdapterAccount) {
-    const values = [account.type, account.provider, account.providerAccountId, account.refresh_token ? encryptToken(account.refresh_token) : null, account.access_token ? encryptToken(account.access_token) : null, account.expires_at, account.token_type, account.scope, account.id_token ? encryptToken(account.id_token) : null, account.session_state, account.userId, oauthEnvironment];
-    const updateValues = [...values.slice(1, 10), oauthEnvironment];
-    const updated = await db.query("update next_auth.accounts set refresh_token = coalesce($3, refresh_token), access_token = coalesce($4, access_token), expires_at = $5, token_type = $6, scope = $7, id_token = $8, session_state = $9 where provider = $1 and \"providerAccountId\" = $2 and oauth_environment = $10", updateValues);
-    if (updated.rowCount === 0) await db.query("insert into next_auth.accounts (type, provider, \"providerAccountId\", refresh_token, access_token, expires_at, token_type, scope, id_token, session_state, \"userId\", oauth_environment) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)", values);
+    await upsertOAuthAccountTokens(db, encryptToken, account, oauthEnvironment);
   },
   async unlinkAccount({ provider, providerAccountId }: Pick<AdapterAccount, "provider" | "providerAccountId">) {
     await db.query("delete from next_auth.accounts where provider = $1 and \"providerAccountId\" = $2 and oauth_environment = $3", [provider, providerAccountId, oauthEnvironment]);

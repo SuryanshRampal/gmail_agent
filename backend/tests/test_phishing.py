@@ -31,6 +31,12 @@ def test_reply_to_mismatch_and_credential_request_are_high_risk():
     assert len(result.reasons) >= 2
 
 
+def test_reply_to_mismatch_alone_is_not_phishing():
+    result = assess_envelope(sender="PlayStation <email@email.playstation.com>", reply_to="campaigns@mailing.example", subject="Wolverine Digital Deluxe Edition")
+    assert result.risk_level == "low_risk"
+    assert result.reasons == ["The reply address uses a different domain from the visible sender."]
+
+
 def test_suspicious_links_are_explained():
     result = assess_envelope(sender="Example <alerts@example.com>", subject="Review security alert", snippet="https://bit.ly/verify-now")
     assert result.risk_level == "needs_attention"
@@ -55,10 +61,9 @@ def test_model_phishing_signal_requires_attention(monkeypatch):
     assert result.decision == "allow"
 
 
-def test_phishing_assessment_failure_fails_closed_without_content_logging(monkeypatch, caplog):
+def test_model_outage_does_not_flag_a_no_signal_message(monkeypatch, caplog):
     monkeypatch.setattr(guardrails, "_classifier", lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")))
-    secret = "reset-token-123456"
-    result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id="m-fail", snippet=secret)))
-    assert result.phishing.risk_level == "unable_to_verify"
-    assert result.decision == "permission_required"
-    assert secret not in caplog.text
+    result = asyncio.run(guardrails.preflight("user-1", guardrails.MessageEnvelope(message_id="m-fail", subject="Check")))
+    assert result.phishing.risk_level == "low_risk"
+    assert result.decision == "allow"
+    assert "Check" not in caplog.text

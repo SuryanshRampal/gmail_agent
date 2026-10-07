@@ -58,11 +58,34 @@ def _classifier():
     )
 
 
-def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
+def _allow(phishing: PhishingAssessment) -> SensitivityResult:
+    return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="", phishing=phishing)
+
+
+def _permission_required(categories: list[Category], warning: str, phishing: PhishingAssessment) -> SensitivityResult:
+    return SensitivityResult(categories=categories, confidence_band="high", decision="permission_required", warning=warning, phishing=phishing)
+
+
+def _ambiguous_envelope(text: str) -> bool:
+    """Reserve optional inference for bounded envelopes with a possible risk signal."""
+    return bool(re.search(
+        r"\b(account|security|verification|identity|personal|private|document|record|statement|request|clinic|doctor|health)\b",
+        text,
+        re.I,
+    ))
+
+
+def _deterministic_preflight(envelope: MessageEnvelope) -> SensitivityResult | None:
     text = f"From: {envelope.sender}\nSubject: {envelope.subject}\nSnippet: {envelope.snippet}"[:6000]
     phishing = assess_envelope(sender=envelope.sender, reply_to=envelope.reply_to, authentication_results=envelope.authentication_results, subject=envelope.subject, snippet=envelope.snippet)
+    if phishing.risk_level != "low_risk":
+        return _permission_required(
+            [],
+            "This message may contain phishing indicators. Review the security warning before opening its contents.",
+            phishing,
+        )
     # Keep obvious marketing mail usable while the local model is warming up or unavailable.
-    # This is intentionally narrow and never overrides a high-risk signal.
+    # This is intentionally narrow and never overrides a phishing or sensitive signal.
     promotional = re.search(r"\b(sale|offer|discount|coupon|cashback|deal|newsletter|marketing|sponsored|unsubscribe|limited time|breaking news|daily briefing|weekly digest|recommendations?|new releases?|save up to|flight deals?|travel deals?|booking deals?)\b", text, re.I)
     recognized_sender = re.search(r"\b(bloomberg|mcdonald(?:'|’)s|linkedin|facebook|instagram|twitter|x\.com|snapchat|reddit|youtube|pvr|air india|airindia|indigo|spicejet|vistara|emirates|etihad|qatar airways|lufthansa|flydubai|booking\.com|makemytrip|cleartrip|traveloka|expedia|agoda|airbnb|wego|trip|airline|hotel|travel|retail|restaurant|store|newsletters?|marketing|promo|offers?)\b", envelope.sender, re.I)
     financial_hint = re.search(r"\b(bank|account number|credit card|debit card|routing number|statement|transfer|payment confirmation|tax)\b", text, re.I)
@@ -73,13 +96,17 @@ def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
     # and booking/transaction language are the meaningful escalation signals.
     if sensitive_hint:
         categories = (["financial"] if financial_hint else []) + (["medical"] if medical_hint else []) + (["personal"] if personal_hint else [])
-        return SensitivityResult(categories=categories, confidence_band="high", decision="permission_required", warning="This message may contain personal, financial, medical, booking, or security information. Review permission before opening its contents.", phishing=phishing)
+        return _permission_required(categories, "This message may contain personal, financial, medical, booking, or security information. Review permission before opening its contents.", phishing)
     if promotional or recognized_sender:
-        if phishing.risk_level == "low_risk":
-            return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="", phishing=phishing)
-        if phishing.risk_level == "needs_attention":
-            return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="allow", warning="", phishing=phishing)
-        return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="permission_required", warning="This message may contain phishing indicators. Review the security warning before opening its contents.", phishing=phishing)
+        return _allow(phishing)
+    if not _ambiguous_envelope(text):
+        return _allow(phishing)
+    return None
+
+
+def _classify_ambiguous_envelope(envelope: MessageEnvelope) -> SensitivityResult:
+    text = f"From: {envelope.sender}\nSubject: {envelope.subject}\nSnippet: {envelope.snippet}"[:6000]
+    phishing = assess_envelope(sender=envelope.sender, reply_to=envelope.reply_to, authentication_results=envelope.authentication_results, subject=envelope.subject, snippet=envelope.snippet)
     labels = {
         "financial": "financial or banking information",
         "medical": "medical or health information",
@@ -102,7 +129,7 @@ def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
         selected = []
     if top_score < 0.72 or not selected:
         if phishing.risk_level == "low_risk":
-            return SensitivityResult(categories=[], confidence_band="high", decision="allow", warning="", phishing=phishing)
+            return _allow(phishing)
         if phishing.risk_level == "needs_attention":
             return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="allow", warning="", phishing=phishing)
         return SensitivityResult(categories=[], confidence_band=phishing.confidence_band, decision="permission_required", warning="This message may contain phishing indicators. Review the security warning before opening its contents.", phishing=phishing)
@@ -122,6 +149,13 @@ def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
     )
 
 
+def _classify_text(envelope: MessageEnvelope) -> SensitivityResult:
+    deterministic = _deterministic_preflight(envelope)
+    if deterministic is not None:
+        return deterministic
+    return _classify_ambiguous_envelope(envelope)
+
+
 def validate_input(state: GuardrailState) -> GuardrailState:
     if not state.get("user_id") or not state.get("envelope"):
         return {"error": "GUARDRAIL_INPUT_INVALID"}
@@ -132,7 +166,7 @@ def classify(state: GuardrailState) -> GuardrailState:
     try:
         return {"result": _classify_text(state["envelope"])}
     except Exception as error:  # Model/runtime failures must fail closed.
-        logger.warning("Sensitivity classifier unavailable: type=%s", type(error).__name__)
+        logger.warning("Sensitivity classifier unavailable; using protected fallback: type=%s", type(error).__name__)
         return {"result": SensitivityResult()}
 
 
